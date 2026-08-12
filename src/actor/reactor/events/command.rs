@@ -24,6 +24,10 @@ use crate::sys::window_server::WindowServerId;
 pub struct LayoutCommandPayload {
     pub command: LayoutCommand,
     pub command_space: Option<SpaceId>,
+    /// Explicit display-scoped target. `Some` is deliberately distinct from
+    /// `command_space`: an explicit selector must never silently fall back to
+    /// Rift's implicit command context.
+    pub workspace_target_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
     pub visible_space_centers: HashMap<SpaceId, objc2_core_foundation::CGPoint>,
 }
@@ -37,6 +41,7 @@ pub fn handle_command_layout(
     let LayoutCommandPayload {
         command: cmd,
         command_space,
+        workspace_target_space,
         visible_spaces,
         visible_space_centers,
     } = payload;
@@ -69,11 +74,14 @@ pub fn handle_command_layout(
             | LayoutCommand::CreateWorkspace
             | LayoutCommand::SwitchToLastWorkspace
     );
+    let is_explicit_move = workspace_target_space.is_some()
+        && matches!(&cmd, LayoutCommand::MoveWindowToWorkspace { .. });
     let workspace_space = if requires_workspace_space {
-        if let Some(space) = command_space {
+        let target_space = workspace_target_space.or(command_space);
+        if let Some(space) = target_space {
             store_current_floating_positions(state, layout, space);
         }
-        command_space
+        target_space
     } else {
         None
     };
@@ -101,12 +109,25 @@ pub fn handle_command_layout(
             }
         }
         LayoutCommand::MoveWindowToWorkspace { .. } => {
-            if let Some(space) = command_space {
-                layout.layout_engine.handle_virtual_workspace_command(
-                    &mut state.windows,
-                    space,
-                    &cmd,
-                )
+            // A non-following legacy move intentionally uses the existing
+            // command context. `workspace_space` is only populated for
+            // commands that activate a workspace, so using it here would make
+            // the traditional Alt+Shift move-window bindings no-op.
+            let move_space = workspace_target_space.or(command_space);
+            if let Some(space) = move_space {
+                if workspace_target_space.is_some() {
+                    layout.layout_engine.handle_scoped_virtual_workspace_command(
+                        &mut state.windows,
+                        space,
+                        &cmd,
+                    )
+                } else {
+                    layout.layout_engine.handle_virtual_workspace_command(
+                        &mut state.windows,
+                        space,
+                        &cmd,
+                    )
+                }
             } else {
                 EventResponse::default()
             }
@@ -130,7 +151,13 @@ pub fn handle_command_layout(
         return Ok(EventOutcome::no_change());
     }
 
-    let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
+    let arrange_space_scope = if is_explicit_move {
+        // A cross-display move removes the window from the source display too;
+        // arranging all active spaces lets the source reflow immediately.
+        None
+    } else {
+        is_workspace_switch.then_some(workspace_space).flatten()
+    };
     Ok(EventOutcome::layout_changed(false)
         .with_layout_response(response, workspace_space)
         .with_arrange_space_scope(arrange_space_scope))

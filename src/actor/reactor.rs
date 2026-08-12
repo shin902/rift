@@ -64,6 +64,7 @@ mod SpaceEventHandler {
 #[cfg(test)]
 mod tests;
 
+use std::sync::mpsc::SyncSender;
 use std::thread;
 
 use animation::Sender as AnimationSender;
@@ -287,6 +288,14 @@ pub enum Event {
     Query(query::QueryRequest),
 
     Command(Command),
+    /// IPC commands use a reply channel so validation failures (for example a
+    /// disconnected display selector) reach the CLI instead of being reported
+    /// as a successful enqueue.
+    #[serde(skip)]
+    CommandWithResponse {
+        command: Command,
+        response: SyncSender<Result<(), String>>,
+    },
 
     #[serde(skip)]
     RegisterWmSender(crate::actor::wm_controller::Sender),
@@ -981,8 +990,37 @@ impl Reactor {
         self.flush_deferred_visible_refresh();
     }
 
+    fn handle_command_with_response(
+        &mut self,
+        command: Command,
+        response: SyncSender<Result<(), String>>,
+    ) {
+        let previously_focused_window = self.main_window();
+        match self.dispatch_workflow(Event::Command(command)) {
+            Ok(mut outcome) => {
+                let focused_window = self.main_window();
+                if focused_window != previously_focused_window
+                    && let Some(focused_window) = focused_window
+                {
+                    outcome = outcome.with_focused_window_broadcast(focused_window);
+                }
+                self.apply_event_outcome(outcome);
+                let _ = response.send(Ok(()));
+            }
+            Err(error) => {
+                warn!(%error, "reactor command rejected");
+                let _ = response.send(Err(error.to_string()));
+            }
+        }
+    }
+
     #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
     fn handle_event(&mut self, event: Event) {
+        if let Event::CommandWithResponse { command, response } = event {
+            self.handle_command_with_response(command, response);
+            return;
+        }
+
         let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
@@ -1715,6 +1753,8 @@ impl Reactor {
                 );
             }
             Event::Command(Command::Layout(command)) => {
+                let (command, workspace_target_space) =
+                    self.resolve_workspace_display_command(command)?;
                 let command_space = self.command_context_space();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
                 return command_workflow::handle_command_layout(
@@ -1724,6 +1764,7 @@ impl Reactor {
                     command_workflow::LayoutCommandPayload {
                         command,
                         command_space,
+                        workspace_target_space,
                         visible_spaces,
                         visible_space_centers,
                     },
@@ -4585,6 +4626,54 @@ impl Reactor {
         }
 
         best.map(|(_, _, screen)| screen)
+    }
+
+    fn resolve_workspace_display_command(
+        &self,
+        command: layout::LayoutCommand,
+    ) -> anyhow::Result<(layout::LayoutCommand, Option<SpaceId>)> {
+        let layout::LayoutCommand::DisplayScoped { display, command } = command else {
+            return Ok((command, None));
+        };
+
+        let is_workspace_command = matches!(
+            command.as_ref(),
+            layout::LayoutCommand::NextWorkspace(_)
+                | layout::LayoutCommand::PrevWorkspace(_)
+                | layout::LayoutCommand::SwitchToWorkspace(_)
+                | layout::LayoutCommand::MoveWindowToWorkspace { .. }
+                | layout::LayoutCommand::SetWorkspaceLayout { .. }
+                | layout::LayoutCommand::CreateWorkspace
+                | layout::LayoutCommand::SwitchToLastWorkspace
+        );
+        if !is_workspace_command {
+            return Err(anyhow::anyhow!(
+                "display selector can only target a workspace command"
+            ));
+        }
+
+        let selector_description = format!("{display:?}");
+        if crate::sys::display_churn::is_active() {
+            return Err(anyhow::anyhow!(
+                "cannot resolve display selector {selector_description} while display topology is changing"
+            ));
+        }
+        let screen = self.screen_for_selector(&display, None).ok_or_else(|| {
+            anyhow::anyhow!("display selector {selector_description} does not match a connected display")
+        })?;
+        let space = screen.space.ok_or_else(|| {
+            anyhow::anyhow!(
+                "display selector {selector_description} has no current native macOS space"
+            )
+        })?;
+        if !self.is_space_active(space) {
+            return Err(anyhow::anyhow!(
+                "display selector {selector_description} resolves to inactive native macOS space {}",
+                space.get()
+            ));
+        }
+
+        Ok((*command, Some(space)))
     }
 
     fn screen_for_selector(

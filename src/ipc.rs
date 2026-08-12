@@ -1,4 +1,5 @@
 use std::ffi::c_char;
+use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 
 use r#continue::continuation;
@@ -314,7 +315,11 @@ impl MachHandler {
                 };
             }
         };
-        let event = Event::Command(command);
+        let (response_tx, response_rx) = sync_channel(1);
+        let event = Event::CommandWithResponse {
+            command,
+            response: response_tx,
+        };
 
         if let Err(e) = self.reactor.try_send(event) {
             error!("Failed to send command to reactor: {}", e);
@@ -323,8 +328,19 @@ impl MachHandler {
             };
         }
 
-        RiftResponse::Success {
-            data: serde_json::json!("Command executed successfully"),
+        match response_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => RiftResponse::Success {
+                data: serde_json::json!("Command executed successfully"),
+            },
+            Ok(Err(message)) => RiftResponse::Error {
+                error: serde_json::json!({ "message": message }),
+            },
+            Err(error) => RiftResponse::Error {
+                error: serde_json::json!({
+                    "message": "Timed out waiting for command execution",
+                    "details": error.to_string(),
+                }),
+            },
         }
     }
 }

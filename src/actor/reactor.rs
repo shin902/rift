@@ -1030,7 +1030,11 @@ impl Reactor {
                 {
                     outcome = outcome.with_focused_window_broadcast(focused_window);
                 }
+                let process_exit = outcome.process_exit;
                 self.apply_event_outcome(outcome);
+                if process_exit {
+                    std::process::exit(0);
+                }
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }

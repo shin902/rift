@@ -259,10 +259,11 @@ pub fn handle_command_reactor_save_and_exit(
         // A quit request is conditional on a durable master save. Keep Rift running when the
         // snapshot cannot be committed so the user can fix the filesystem problem or retry
         // without losing the only complete in-memory layout.
-        return Ok(EventOutcome::no_change()
-            .with_stdout_line(format!("Could not save master file; Rift is still running: {e}")));
+        return Err(anyhow::anyhow!(
+            "Could not save master file; Rift is still running: {e}"
+        ));
     }
-    std::process::exit(0);
+    Ok(EventOutcome::no_change().with_process_exit())
 }
 
 fn save_layout(

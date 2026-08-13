@@ -78,6 +78,7 @@ pub(crate) struct EventOutcome {
     pub(crate) refresh_window_notifications: bool,
     pub(crate) refresh_focus_follows_mouse: bool,
     pub(crate) refresh_layout_mode: bool,
+    pub(crate) process_exit: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -145,6 +146,7 @@ impl EventOutcome {
         self.refresh_window_notifications |= other.refresh_window_notifications;
         self.refresh_focus_follows_mouse |= other.refresh_focus_follows_mouse;
         self.refresh_layout_mode |= other.refresh_layout_mode;
+        self.process_exit |= other.process_exit;
     }
 
     /// The event changed geometry or layout state and requires one arrange pass.
@@ -189,6 +191,7 @@ impl EventOutcome {
             refresh_window_notifications: false,
             refresh_focus_follows_mouse: false,
             refresh_layout_mode: true,
+            process_exit: false,
         }
     }
 
@@ -411,6 +414,11 @@ impl EventOutcome {
 
     pub(crate) fn with_focused_window_broadcast(mut self, window: WindowId) -> Self {
         self.focused_window_broadcast = Some(window);
+        self
+    }
+
+    pub(crate) fn with_process_exit(mut self) -> Self {
+        self.process_exit = true;
         self
     }
 }

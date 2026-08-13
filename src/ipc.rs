@@ -401,8 +401,19 @@ unsafe extern "C" fn handle_mach_request_c(
         }
     };
 
+    let should_exit_after_response = matches!(
+        &request,
+        RiftRequest::ExecuteCommand {
+            command: rift_protocol::RiftCommand::Reactor(
+                rift_protocol::ReactorCommand::SaveAndExit,
+            ),
+        }
+    );
     let response = handler.handle_request(request, client_port);
     send_response(original_msg, &response);
+    if should_exit_after_response && matches!(response, RiftResponse::Success { .. }) {
+        std::process::exit(0);
+    }
 }
 
 fn send_response(original_msg: *mut mach_msg_header_t, response: &RiftResponse) {

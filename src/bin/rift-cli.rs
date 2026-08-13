@@ -268,17 +268,44 @@ enum SpaceCommands {
 #[derive(Subcommand)]
 enum WorkspaceCommands {
     /// Switch to next workspace
-    Next { skip_empty: Option<bool> },
+    Next {
+        skip_empty: Option<bool>,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
+    },
     /// Switch to previous workspace
-    Prev { skip_empty: Option<bool> },
+    Prev {
+        skip_empty: Option<bool>,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
+    },
     /// Switch to specific workspace
-    Switch { workspace_id: usize },
+    Switch {
+        workspace_id: usize,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
+    },
     /// Move current window to workspace
     MoveWindow {
         workspace_id: usize,
         /// Switch to the destination workspace after moving the window.
         #[arg(long)]
         follow: bool,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
+        window_id: Option<u32>,
+    },
+    /// Move the current window to a workspace and follow it.
+    #[command(name = "move-and-follow")]
+    MoveAndFollow {
+        workspace_id: usize,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
         window_id: Option<u32>,
     },
     /// Create a new workspace
@@ -290,6 +317,9 @@ enum WorkspaceCommands {
         /// Workspace index (0-based). Defaults to active workspace if omitted.
         #[arg(long)]
         workspace_id: Option<usize>,
+        /// Target display UUID. When omitted, use Rift's existing command context.
+        #[arg(long = "display-uuid")]
+        display_uuid: Option<String>,
         /// Layout mode: traditional, bsp, stack, master_stack, scrolling
         mode: String,
     },
@@ -846,38 +876,75 @@ fn parse_layout_mode(value: &str) -> Result<LayoutMode, String> {
 fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
     use layout::LayoutCommand as LC;
     match cmd {
-        WorkspaceCommands::Next { skip_empty } => Ok(CliCommand::Reactor(
-            reactor::Command::Layout(LC::NextWorkspace(skip_empty)),
-        )),
-        WorkspaceCommands::Prev { skip_empty } => Ok(CliCommand::Reactor(
-            reactor::Command::Layout(LC::PrevWorkspace(skip_empty)),
-        )),
-        WorkspaceCommands::Switch { workspace_id } => Ok(CliCommand::Reactor(
-            reactor::Command::Layout(LC::SwitchToWorkspace(workspace_id)),
-        )),
+        WorkspaceCommands::Next { skip_empty, display_uuid } => {
+            let command = LC::NextWorkspace(skip_empty);
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                scope_workspace_command(command, display_uuid),
+            )))
+        }
+        WorkspaceCommands::Prev { skip_empty, display_uuid } => {
+            let command = LC::PrevWorkspace(skip_empty);
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                scope_workspace_command(command, display_uuid),
+            )))
+        }
+        WorkspaceCommands::Switch { workspace_id, display_uuid } => {
+            let command = LC::SwitchToWorkspace(workspace_id);
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                scope_workspace_command(command, display_uuid),
+            )))
+        }
         WorkspaceCommands::MoveWindow {
             workspace_id,
             follow,
+            display_uuid,
             window_id,
-        } => Ok(CliCommand::Reactor(reactor::Command::Layout(
-            LC::MoveWindowToWorkspace {
+        } => {
+            let command = LC::MoveWindowToWorkspace {
                 workspace: WorkspaceSelector::Index(workspace_id),
                 follow,
                 window_id,
-            },
-        ))),
+            };
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                scope_workspace_command(command, display_uuid),
+            )))
+        }
+        WorkspaceCommands::MoveAndFollow { workspace_id, display_uuid, window_id } => {
+            let command = LC::MoveWindowToWorkspace {
+                workspace: WorkspaceSelector::Index(workspace_id),
+                follow: true,
+                window_id,
+            };
+            Ok(CliCommand::Reactor(reactor::Command::Layout(
+                scope_workspace_command(command, display_uuid),
+            )))
+        }
         WorkspaceCommands::Create => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::CreateWorkspace,
         ))),
         WorkspaceCommands::Last => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
-        WorkspaceCommands::SetLayout { workspace_id, mode } => {
+        WorkspaceCommands::SetLayout { workspace_id, display_uuid, mode } => {
             let mode = parse_layout_mode(&mode)?;
+            let command = LC::SetWorkspaceLayout { workspace: workspace_id, mode };
             Ok(CliCommand::Reactor(reactor::Command::Layout(
-                LC::SetWorkspaceLayout { workspace: workspace_id, mode },
+                scope_workspace_command(command, display_uuid),
             )))
         }
+    }
+}
+
+fn scope_workspace_command(
+    command: layout::LayoutCommand,
+    display_uuid: Option<String>,
+) -> layout::LayoutCommand {
+    match display_uuid {
+        Some(uuid) => layout::LayoutCommand::DisplayScoped {
+            display: DisplaySelector::Uuid(uuid),
+            command: Box::new(command),
+        },
+        None => command,
     }
 }
 
@@ -1162,6 +1229,67 @@ mod tests {
             serde_json::to_value(request).unwrap(),
             serde_json::json!({
                 "execute_command": { "command": { "layout": "next_window" } }
+            })
+        );
+    }
+
+    #[test]
+    fn display_scoped_workspace_commands_keep_the_selector_in_the_wire_payload() {
+        let request = build_execute_request(ExecuteCommands::Workspace {
+            workspace_cmd: WorkspaceCommands::Switch {
+                workspace_id: 1,
+                display_uuid: Some("display-a".into()),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "execute_command": {
+                    "command": {
+                        "layout": {
+                            "display_scoped": {
+                                "display": "display-a",
+                                "command": { "switch_to_workspace": 1 }
+                            }
+                        }
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn move_and_follow_is_encoded_as_a_scoped_following_move() {
+        let request = build_execute_request(ExecuteCommands::Workspace {
+            workspace_cmd: WorkspaceCommands::MoveAndFollow {
+                workspace_id: 1,
+                display_uuid: Some("display-a".into()),
+                window_id: None,
+            },
+        })
+        .unwrap();
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "execute_command": {
+                    "command": {
+                        "layout": {
+                            "display_scoped": {
+                                "display": "display-a",
+                                "command": {
+                                    "move_window_to_workspace": {
+                                        "workspace": 1,
+                                        "follow": true,
+                                        "window_id": null
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             })
         );
     }

@@ -129,6 +129,30 @@ mod tests {
     }
 
     #[test]
+    fn display_scoped_workspace_commands_decode_from_the_wire() {
+        let request: RiftRequest = serde_json::from_value(serde_json::json!({
+            "execute_command": {
+                "command": {
+                    "layout": {
+                        "display_scoped": {
+                            "display": "display-a",
+                            "command": { "switch_to_workspace": 1 }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(request, RiftRequest::ExecuteCommand {
+            command: RiftCommand::Layout(LayoutCommand::DisplayScoped {
+                display: crate::DisplaySelector::Uuid("display-a".into()),
+                command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+            }),
+        });
+    }
+
+    #[test]
     fn legacy_stringified_reactor_commands_still_decode() {
         let request: RiftRequest = serde_json::from_value(serde_json::json!({
             "execute_command": {

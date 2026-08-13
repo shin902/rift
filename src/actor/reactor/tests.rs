@@ -693,6 +693,114 @@ fn menu_bar_space_falls_back_when_preferred_space_is_not_visible() {
 }
 
 #[test]
+fn display_scoped_workspace_switch_uses_only_the_selected_display() {
+    let mut reactor = test_reactor();
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let space1 = SpaceId::new(1);
+    let space2 = SpaceId::new(2);
+
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(space1),
+        Some(space2),
+    ]));
+    let before_left = reactor.layout_manager.layout_engine.active_workspace_idx(space1);
+
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::DisplayScoped {
+            display: DisplaySelector::Uuid("test-display-1".into()),
+            command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+        },
+    )));
+
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(space1),
+        before_left,
+        "the non-selected display must not switch"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(space2),
+        Some(1),
+        "the selected display must switch even when it is not the implicit command context"
+    );
+}
+
+#[test]
+fn display_scoped_workspace_selector_rejects_missing_or_inactive_displays() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+
+    let missing = reactor
+        .dispatch_workflow(Event::Command(Command::Layout(
+            LayoutCommand::DisplayScoped {
+                display: DisplaySelector::Uuid("missing-display".into()),
+                command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+            },
+        )))
+        .expect_err("a missing display must be an explicit command error");
+    assert!(missing.to_string().contains("does not match a connected display"));
+
+    reactor.active_spaces.clear();
+    let inactive = reactor
+        .dispatch_workflow(Event::Command(Command::Layout(
+            LayoutCommand::DisplayScoped {
+                display: DisplaySelector::Uuid("test-display-0".into()),
+                command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+            },
+        )))
+        .expect_err("an inactive native space must be an explicit command error");
+    assert!(inactive.to_string().contains("inactive native macOS space"));
+}
+
+#[test]
+fn display_scoped_move_and_follow_reassigns_window_to_target_display_workspace() {
+    let mut reactor = test_reactor();
+    let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let source_space = SpaceId::new(1);
+    let target_space = SpaceId::new(2);
+    let window = WindowId::new(7, 1);
+
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(source_space),
+        Some(target_space),
+    ]));
+    reactor.add_test_window(window, WindowServerId::new(11), Some(source_space), left);
+    reactor.send_layout_event(LayoutEvent::WindowAdded(source_space, window));
+    reactor.send_layout_event(LayoutEvent::WindowFocused(source_space, window));
+    let target_workspace = reactor.test_workspace(target_space, 1);
+
+    reactor.handle_event(Event::Command(Command::Layout(
+        LayoutCommand::DisplayScoped {
+            display: DisplaySelector::Uuid("test-display-1".into()),
+            command: Box::new(LayoutCommand::MoveWindowToWorkspace {
+                workspace: WorkspaceSelector::Index(1),
+                follow: true,
+                window_id: None,
+            }),
+        },
+    )));
+
+    assert_eq!(
+        reactor.test_workspace_for_window(target_space, window),
+        Some(target_workspace)
+    );
+    assert_eq!(reactor.test_workspace_for_window(source_space, window), None);
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(target_space),
+        Some(1),
+        "follow must switch the selected display to the destination workspace"
+    );
+    assert_eq!(
+        reactor.layout_manager.layout_engine.active_workspace_idx(source_space),
+        Some(0),
+        "moving a window must not switch the source display"
+    );
+}
+
+#[test]
 fn workspace_queries_are_isolated_per_macos_space() {
     let mut reactor = test_reactor();
     let left = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));

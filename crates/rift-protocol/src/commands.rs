@@ -40,6 +40,14 @@ pub enum LayoutCommand {
     NextWorkspace(Option<bool>),
     PrevWorkspace(Option<bool>),
     SwitchToWorkspace(usize),
+    /// Execute a workspace-scoped command against the virtual workspace set
+    /// belonging to the selected display. The reactor resolves the display
+    /// selector to the current native macOS space before dispatching the
+    /// wrapped command.
+    DisplayScoped {
+        display: DisplaySelector,
+        command: Box<LayoutCommand>,
+    },
     MoveWindowToWorkspace {
         workspace: WorkspaceSelector,
         follow: bool,

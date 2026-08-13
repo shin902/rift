@@ -53,6 +53,20 @@ Get up and running via the wiki:
 [<kbd><br>quick start<br></kbd>][quick_start]
 <br>
 
+## Display-scoped virtual workspaces
+When multiple displays have independent virtual workspaces, target a display by
+UUID instead of relying on Rift's implicit command context:
+
+```sh
+rift-cli execute workspace switch 1 --display-uuid <display-uuid>
+rift-cli execute workspace move-window 1 --display-uuid <display-uuid>
+rift-cli execute workspace move-and-follow 1 --display-uuid <display-uuid>
+```
+
+Use `rift-cli query displays` to find display UUIDs. Add `--follow`, or use
+`workspace move-and-follow`, to switch to the destination workspace after the
+move.
+
 ## Status
 Rift is a stable, reliable, and performant window manager used by many. It is still in development and thus new features, optimizations, and general improvements are regularly released, but is more than good enough for daily use.
 

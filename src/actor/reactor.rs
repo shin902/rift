@@ -148,9 +148,7 @@ impl MouseFocusPublisher {
         })
     }
 
-    fn take_latest(&self) -> Option<CGPoint> {
-        self.0.latest.lock().take()
-    }
+    fn take_latest(&self) -> Option<CGPoint> { self.0.latest.lock().take() }
 }
 
 #[cfg(test)]
@@ -186,17 +184,11 @@ pub struct ReactorHandle {
 }
 
 impl ReactorHandle {
-    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self {
-        Self { sender, queries }
-    }
+    pub fn new(sender: Sender, queries: ReactorQueryHandle) -> Self { Self { sender, queries } }
 
-    pub fn sender(&self) -> Sender {
-        self.sender.clone()
-    }
+    pub fn sender(&self) -> Sender { self.sender.clone() }
 
-    pub fn send(&self, event: Event) {
-        self.sender.send(event)
-    }
+    pub fn send(&self, event: Event) { self.sender.send(event) }
 
     pub fn try_send(
         &self,
@@ -209,9 +201,7 @@ impl ReactorHandle {
 impl std::ops::Deref for ReactorHandle {
     type Target = ReactorQueryHandle;
 
-    fn deref(&self) -> &Self::Target {
-        &self.queries
-    }
+    fn deref(&self) -> &Self::Target { &self.queries }
 }
 
 use crate::model::server::RuntimeWindowData;
@@ -555,9 +545,7 @@ impl Reactor {
         }
     }
 
-    fn is_space_active(&self, space: SpaceId) -> bool {
-        self.active_spaces.contains(&space)
-    }
+    fn is_space_active(&self, space: SpaceId) -> bool { self.active_spaces.contains(&space) }
 
     fn iter_active_spaces(&self) -> impl Iterator<Item = SpaceId> + '_ {
         self.active_spaces.iter().copied()
@@ -1169,9 +1157,7 @@ impl Reactor {
             && matches!(event, Event::SpaceCreated(..) | Event::SpaceDestroyed(..))
     }
 
-    fn refreshes_blocked(&self) -> bool {
-        self.refresh_quarantine_manager.blocks_refreshes()
-    }
+    fn refreshes_blocked(&self) -> bool { self.refresh_quarantine_manager.blocks_refreshes() }
 
     fn defer_window_inventory_refresh(&mut self) {
         self.refresh_quarantine_manager.pending_inventory_refresh = true;
@@ -4132,13 +4118,10 @@ impl Reactor {
                 let Some(window) = self.state.windows.window(wid) else {
                     continue;
                 };
-                self.send_layout_event(LayoutEvent::WindowObserved(
-                    space,
-                    ResolvedWindow {
-                        info: window.layout_info(wid),
-                        effects,
-                    },
-                ));
+                self.send_layout_event(LayoutEvent::WindowObserved(space, ResolvedWindow {
+                    info: window.layout_info(wid),
+                    effects,
+                }));
             }
         }
     }
@@ -4936,9 +4919,7 @@ impl Reactor {
         }
     }
 
-    pub(crate) fn main_window(&self) -> Option<WindowId> {
-        self.main_window_tracker.main_window()
-    }
+    pub(crate) fn main_window(&self) -> Option<WindowId> { self.main_window_tracker.main_window() }
 
     fn main_window_space(&self) -> Option<SpaceId> {
         // TODO: Optimize this with a cache or something.
@@ -4957,9 +4938,7 @@ impl Reactor {
         (self.workspace_command_space() == Some(space)).then_some((space, window))
     }
 
-    fn raw_command_space(&self) -> Option<SpaceId> {
-        self.space_state.command_space
-    }
+    fn raw_command_space(&self) -> Option<SpaceId> { self.space_state.command_space }
 
     fn active_display_space(&self) -> Option<SpaceId> {
         self.raw_command_space()

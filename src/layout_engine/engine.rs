@@ -2842,13 +2842,15 @@ impl LayoutEngine {
             self.virtual_workspace_manager
                 .find_window_by_idx(window_store, target_space, *index)
                 .or_else(|| {
-                    self.virtual_workspace_manager
-                        .initialized_spaces()
-                        .into_iter()
-                        .find_map(|space| {
-                            self.virtual_workspace_manager
-                                .find_window_by_idx(window_store, space, *index)
-                        })
+                    self.virtual_workspace_manager.initialized_spaces().into_iter().find_map(
+                        |space| {
+                            self.virtual_workspace_manager.find_window_by_idx(
+                                window_store,
+                                space,
+                                *index,
+                            )
+                        },
+                    )
                 })
         } else {
             self.focused_window
@@ -2868,32 +2870,38 @@ impl LayoutEngine {
         if source_space == target_space {
             return self.handle_virtual_workspace_command(window_store, target_space, command);
         }
-        let source_workspace_id = self
-            .virtual_workspace_manager
-            .workspace_for_window(window_store, source_space, window);
-        let target_workspaces = self
-            .virtual_workspace_manager_mut()
-            .list_workspaces(target_space)
-            .to_vec();
-        let current_target_workspace = self.virtual_workspace_manager.active_workspace(target_space);
-        let Some(target_workspace_id) = (match workspace {
-            WorkspaceSelector::Index(index) => target_workspaces.get(*index).map(|(id, _)| *id),
-            WorkspaceSelector::Name(name) if name == "next" => current_target_workspace.and_then(
-                |current| {
-                    self.virtual_workspace_manager
-                        .next_workspace(window_store, target_space, current, None)
-                },
-            ),
-            WorkspaceSelector::Name(name) if name == "prev" => current_target_workspace.and_then(
-                |current| {
-                    self.virtual_workspace_manager
-                        .prev_workspace(window_store, target_space, current, None)
-                },
-            ),
-            WorkspaceSelector::Name(name) => target_workspaces
-                .iter()
-                .find_map(|(id, workspace_name)| (workspace_name == name).then_some(*id)),
-        })
+        let source_workspace_id =
+            self.virtual_workspace_manager
+                .workspace_for_window(window_store, source_space, window);
+        let target_workspaces =
+            self.virtual_workspace_manager_mut().list_workspaces(target_space).to_vec();
+        let current_target_workspace =
+            self.virtual_workspace_manager.active_workspace(target_space);
+        let Some(target_workspace_id) =
+            (match workspace {
+                WorkspaceSelector::Index(index) => target_workspaces.get(*index).map(|(id, _)| *id),
+                WorkspaceSelector::Name(name) if name == "next" => current_target_workspace
+                    .and_then(|current| {
+                        self.virtual_workspace_manager.next_workspace(
+                            window_store,
+                            target_space,
+                            current,
+                            None,
+                        )
+                    }),
+                WorkspaceSelector::Name(name) if name == "prev" => current_target_workspace
+                    .and_then(|current| {
+                        self.virtual_workspace_manager.prev_workspace(
+                            window_store,
+                            target_space,
+                            current,
+                            None,
+                        )
+                    }),
+                WorkspaceSelector::Name(name) => target_workspaces
+                    .iter()
+                    .find_map(|(id, workspace_name)| (workspace_name == name).then_some(*id)),
+            })
         else {
             return EventResponse::default();
         };
@@ -2914,7 +2922,8 @@ impl LayoutEngine {
             if was_floating {
                 self.floating.add_active(source_space, window.pid, window);
             } else if let Some(source_workspace_id) = source_workspace_id
-                && let Some(source_layout) = self.workspace_layouts.active(source_space, source_workspace_id)
+                && let Some(source_layout) =
+                    self.workspace_layouts.active(source_space, source_workspace_id)
             {
                 self.workspace_tree_mut(source_workspace_id)
                     .add_window_after_selection(source_layout, window);
@@ -2939,7 +2948,9 @@ impl LayoutEngine {
         if was_floating {
             self.floating.add_active(target_space, window.pid, window);
             self.floating.set_last_focus(Some(window));
-        } else if let Some(target_layout) = self.workspace_layouts.active(target_space, target_workspace_id) {
+        } else if let Some(target_layout) =
+            self.workspace_layouts.active(target_space, target_workspace_id)
+        {
             self.workspace_tree_mut(target_workspace_id)
                 .add_window_after_selection(target_layout, window);
         }
@@ -2948,11 +2959,17 @@ impl LayoutEngine {
             && self.virtual_workspace_manager.active_workspace(source_space)
                 == Some(source_workspace_id)
         {
-            self.virtual_workspace_manager
-                .set_last_focused_window(source_space, source_workspace_id, None);
+            self.virtual_workspace_manager.set_last_focused_window(
+                source_space,
+                source_workspace_id,
+                None,
+            );
         }
-        self.virtual_workspace_manager
-            .set_last_focused_window(target_space, target_workspace_id, Some(window));
+        self.virtual_workspace_manager.set_last_focused_window(
+            target_space,
+            target_workspace_id,
+            Some(window),
+        );
         if self.focused_window == Some(window) {
             self.focused_window = None;
         }
@@ -2960,11 +2977,18 @@ impl LayoutEngine {
         self.broadcast_windows_changed(window_store, source_space);
 
         if *follow {
-            return self.activate_workspace(window_store, target_space, target_workspace_id, Some(window));
+            return self.activate_workspace(
+                window_store,
+                target_space,
+                target_workspace_id,
+                Some(window),
+            );
         }
         self.broadcast_windows_changed(window_store, target_space);
 
-        if self.virtual_workspace_manager.active_workspace(target_space) == Some(target_workspace_id) {
+        if self.virtual_workspace_manager.active_workspace(target_space)
+            == Some(target_workspace_id)
+        {
             return EventResponse {
                 changed: true,
                 raise_windows: vec![window],
@@ -2974,8 +2998,7 @@ impl LayoutEngine {
         }
 
         let focus_window = if source_workspace_id.is_some()
-            && self.virtual_workspace_manager.active_workspace(source_space)
-                == source_workspace_id
+            && self.virtual_workspace_manager.active_workspace(source_space) == source_workspace_id
         {
             self.virtual_workspace_manager
                 .windows_in_active_workspace(window_store, source_space)

@@ -150,14 +150,11 @@ impl IpcRequestHandler {
             }
         };
         trace!(?request, client_port, "Handling IPC request");
-        let should_exit_after_response = matches!(
-            &request,
-            RiftRequest::ExecuteCommand {
-                command: rift_protocol::RiftCommand::Reactor(
-                    rift_protocol::ReactorCommand::SaveAndExit,
-                ),
-            }
-        );
+        let should_exit_after_response = matches!(&request, RiftRequest::ExecuteCommand {
+            command: rift_protocol::RiftCommand::Reactor(
+                rift_protocol::ReactorCommand::SaveAndExit,
+            ),
+        });
 
         let response = match request {
             request @ (RiftRequest::GetConfig

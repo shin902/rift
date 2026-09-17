@@ -799,12 +799,10 @@ fn display_scoped_workspace_switch_uses_only_the_selected_display() {
     ]));
     let before_left = reactor.layout_manager.layout_engine.active_workspace_idx(space1);
 
-    reactor.handle_event(Event::Command(Command::Layout(
-        LayoutCommand::DisplayScoped {
-            display: DisplaySelector::Uuid("test-display-1".into()),
-            command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
-        },
-    )));
+    reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::DisplayScoped {
+        display: DisplaySelector::Uuid("test-display-1".into()),
+        command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+    })));
 
     assert_eq!(
         reactor.layout_manager.layout_engine.active_workspace_idx(space1),
@@ -826,23 +824,19 @@ fn display_scoped_workspace_selector_rejects_missing_or_inactive_displays() {
     reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
 
     let missing = reactor
-        .dispatch_workflow(Event::Command(Command::Layout(
-            LayoutCommand::DisplayScoped {
-                display: DisplaySelector::Uuid("missing-display".into()),
-                command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
-            },
-        )))
+        .dispatch_workflow(Event::Command(Command::Layout(LayoutCommand::DisplayScoped {
+            display: DisplaySelector::Uuid("missing-display".into()),
+            command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+        })))
         .expect_err("a missing display must be an explicit command error");
     assert!(missing.to_string().contains("does not match a connected display"));
 
     reactor.active_spaces.clear();
     let inactive = reactor
-        .dispatch_workflow(Event::Command(Command::Layout(
-            LayoutCommand::DisplayScoped {
-                display: DisplaySelector::Uuid("test-display-0".into()),
-                command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
-            },
-        )))
+        .dispatch_workflow(Event::Command(Command::Layout(LayoutCommand::DisplayScoped {
+            display: DisplaySelector::Uuid("test-display-0".into()),
+            command: Box::new(LayoutCommand::SwitchToWorkspace(1)),
+        })))
         .expect_err("an inactive native space must be an explicit command error");
     assert!(inactive.to_string().contains("inactive native macOS space"));
 }
@@ -865,16 +859,14 @@ fn display_scoped_move_and_follow_reassigns_window_to_target_display_workspace()
     reactor.send_layout_event(LayoutEvent::WindowFocused(source_space, window));
     let target_workspace = reactor.test_workspace(target_space, 1);
 
-    reactor.handle_event(Event::Command(Command::Layout(
-        LayoutCommand::DisplayScoped {
-            display: DisplaySelector::Uuid("test-display-1".into()),
-            command: Box::new(LayoutCommand::MoveWindowToWorkspace {
-                workspace: WorkspaceSelector::Index(1),
-                follow: true,
-                window_id: None,
-            }),
-        },
-    )));
+    reactor.handle_event(Event::Command(Command::Layout(LayoutCommand::DisplayScoped {
+        display: DisplaySelector::Uuid("test-display-1".into()),
+        command: Box::new(LayoutCommand::MoveWindowToWorkspace {
+            workspace: WorkspaceSelector::Index(1),
+            follow: true,
+            window_id: None,
+        }),
+    })));
 
     assert_eq!(
         reactor.test_workspace_for_window(target_space, window),

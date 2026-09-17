@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::WindowId;
@@ -45,7 +43,6 @@ pub struct WindowRecord {
     pending_operation: Option<PendingWindowOperation>,
     operation_generation: u64,
     rule_floating: bool,
-    last_rule_decision: bool,
 }
 
 impl WindowRecord {
@@ -63,12 +60,11 @@ impl WindowRecord {
         self.pending_operation.and_then(|operation| operation.requested_frame)
     }
 
-    pub fn is_manageable(&self) -> bool {
-        self.state.as_ref().is_some_and(|state| state.is_manageable)
-    }
-
-    pub fn is_effectively_manageable(&self) -> bool {
-        self.state.as_ref().is_some_and(WindowState::is_effectively_manageable)
+    pub(crate) fn is_admitted_with_rule_override(
+        &self,
+        rule_override: Option<bool>,
+    ) -> Option<bool> {
+        self.state.as_ref().map(|state| state.is_admitted_with_override(rule_override))
     }
 
     pub fn window_server_id(&self) -> Option<WindowServerId> { self.window_server_id }
@@ -126,7 +122,6 @@ struct WindowServerRecord {
     observed: bool,
     space: Option<SpaceId>,
     info: Option<WindowServerInfo>,
-    recent_at: Option<Instant>,
     pending_native_fullscreen: Option<PendingNativeFullscreenState>,
 }
 
@@ -309,7 +304,6 @@ impl WindowStore {
                 && record.window_server_id.is_none()
                 && record.workspace.is_none()
                 && !record.rule_floating
-                && !record.last_rule_decision
         });
         if should_remove {
             self.windows.remove(&window_id);
@@ -329,7 +323,6 @@ impl WindowStore {
                 && !record.observed
                 && record.space.is_none()
                 && record.info.is_none()
-                && record.recent_at.is_none()
                 && record.pending_native_fullscreen.is_none()
         });
         if should_remove {
@@ -496,7 +489,6 @@ impl WindowStore {
             record.observed = false;
             record.space = None;
             record.info = None;
-            record.recent_at = None;
         }
         if let Some(wid) = wid
             && let Some(record) = self.windows.get_mut(&wid)
@@ -752,26 +744,18 @@ impl WindowStore {
             return;
         }
 
-        let (
-            workspace,
-            rule_floating,
-            last_rule_decision,
-            placement,
-            visibility,
-            pending,
-            generation,
-        ) = match self.windows.get(&from) {
-            Some(record) => (
-                record.workspace,
-                record.rule_floating,
-                record.last_rule_decision,
-                record.placement,
-                record.visibility,
-                record.pending_operation,
-                record.operation_generation,
-            ),
-            None => return,
-        };
+        let (workspace, rule_floating, placement, visibility, pending, generation) =
+            match self.windows.get(&from) {
+                Some(record) => (
+                    record.workspace,
+                    record.rule_floating,
+                    record.placement,
+                    record.visibility,
+                    record.pending_operation,
+                    record.operation_generation,
+                ),
+                None => return,
+            };
 
         let target_workspace = self.windows.get(&to).and_then(|record| record.workspace);
 
@@ -788,7 +772,6 @@ impl WindowStore {
             target.workspace = workspace;
         }
         target.rule_floating |= rule_floating;
-        target.last_rule_decision |= last_rule_decision;
         target.placement = placement;
         target.visibility = visibility;
         target.pending_operation = pending;
@@ -798,7 +781,6 @@ impl WindowStore {
         if let Some(source) = self.windows.get_mut(&from) {
             source.workspace = None;
             source.rule_floating = false;
-            source.last_rule_decision = false;
             source.pending_operation = None;
         }
 
@@ -821,15 +803,16 @@ impl WindowStore {
         self.prune_window_record(from);
     }
 
-    pub fn set_rule_floating(&mut self, window_id: WindowId, value: bool) {
+    pub fn replace_rule_floating(&mut self, window_id: WindowId, value: bool) -> bool {
         let record = self.windows.entry(window_id).or_default();
-        record.rule_floating = value;
+        let previous = std::mem::replace(&mut record.rule_floating, value);
         record.placement = if value {
             WindowPlacement::Floating
         } else {
             WindowPlacement::Tiled
         };
         self.prune_window_record(window_id);
+        previous
     }
 
     pub fn clear_rule_floating(&mut self, window_id: WindowId) {
@@ -846,19 +829,9 @@ impl WindowStore {
         self.windows.get(&window_id).is_some_and(|record| record.rule_floating)
     }
 
-    pub fn set_last_rule_decision(&mut self, window_id: WindowId, value: bool) {
-        self.windows.entry(window_id).or_default().last_rule_decision = value;
-        self.app_windows.entry(window_id.pid).or_default().insert(window_id);
-    }
-
-    pub fn last_rule_decision(&self, window_id: WindowId) -> bool {
-        self.windows.get(&window_id).is_some_and(|record| record.last_rule_decision)
-    }
-
     pub fn clear_rule_metadata(&mut self, window_id: WindowId) {
         if let Some(record) = self.windows.get_mut(&window_id) {
             record.rule_floating = false;
-            record.last_rule_decision = false;
         }
         self.prune_window_record(window_id);
     }
@@ -962,36 +935,6 @@ impl WindowStore {
             if record.space == Some(old_space) {
                 record.space = Some(new_space);
             }
-        }
-    }
-
-    pub fn mark_wsids_recent<I>(&mut self, wsids: I)
-    where I: IntoIterator<Item = WindowServerId> {
-        let now = Instant::now();
-        for wsid in wsids {
-            self.server_record_mut(wsid).recent_at = Some(now);
-        }
-    }
-
-    pub fn is_wsid_recent(&self, wsid: WindowServerId, ttl_ms: u64) -> bool {
-        self.window_servers
-            .get(&wsid)
-            .and_then(|record| record.recent_at)
-            .is_some_and(|ts| ts.elapsed().as_millis() < ttl_ms as u128)
-    }
-
-    pub fn purge_expired(&mut self, ttl_ms: u64) {
-        let now = Instant::now();
-        let wsids: Vec<_> = self.window_servers.keys().copied().collect();
-        for wsid in wsids {
-            if let Some(record) = self.window_servers.get_mut(&wsid)
-                && record
-                    .recent_at
-                    .is_some_and(|ts| now.duration_since(ts).as_millis() >= ttl_ms as u128)
-            {
-                record.recent_at = None;
-            }
-            self.prune_window_server_record(wsid);
         }
     }
 

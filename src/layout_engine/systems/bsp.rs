@@ -1,11 +1,14 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
+use slotmap::Key;
 
 use crate::actor::app::{WindowId, pid_t};
-use crate::common::collections::{HashMap, HashSet};
+use crate::common::collections::HashMap;
 use crate::common::config::WindowInsertionPoint;
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
-use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
+use crate::layout_engine::systems::{
+    LayoutSystem, WindowLayoutConstraints, reconcile_app_membership,
+};
 use crate::layout_engine::utils::compute_tiling_area;
 use crate::layout_engine::{Direction, LayoutId, LayoutKind, Orientation, ResizeOrientation};
 use crate::model::selection::*;
@@ -481,7 +484,7 @@ impl BspLayoutSystem {
                     let mut target = if *fullscreen {
                         screen
                     } else if *fullscreen_within_gaps {
-                        Self::apply_outer_gaps(screen, gaps)
+                        compute_tiling_area(screen, gaps)
                     } else {
                         rect
                     };
@@ -710,10 +713,6 @@ impl BspLayoutSystem {
         }
     }
 
-    fn apply_outer_gaps(screen: CGRect, gaps: &crate::common::config::GapSettings) -> CGRect {
-        compute_tiling_area(screen, gaps)
-    }
-
     fn selection_window(&self, state: &LayoutState) -> Option<WindowId> {
         let sel = self.tree.data.selection.current_selection(state.root);
         match self.kind.get(sel) {
@@ -730,27 +729,21 @@ struct Components {
 
 impl crate::model::tree::Observer for Components {
     fn added_to_forest(&mut self, map: &NodeMap, node: NodeId) {
-        self.dispatch_event(map, TreeEvent::AddedToForest(node))
+        self.selection.handle_event(map, TreeEvent::AddedToForest(node))
     }
 
     fn added_to_parent(&mut self, map: &NodeMap, node: NodeId) {
-        self.dispatch_event(map, TreeEvent::AddedToParent(node))
+        self.selection.handle_event(map, TreeEvent::AddedToParent(node))
     }
 
     fn removing_from_parent(&mut self, map: &NodeMap, node: NodeId) {
-        self.dispatch_event(map, TreeEvent::RemovingFromParent(node))
+        self.selection.handle_event(map, TreeEvent::RemovingFromParent(node))
     }
 
     fn removed_child(_tree: &mut Tree<Self>, _parent: NodeId) {}
 
     fn removed_from_forest(&mut self, map: &NodeMap, node: NodeId) {
-        self.dispatch_event(map, TreeEvent::RemovedFromForest(node))
-    }
-}
-
-impl Components {
-    fn dispatch_event(&mut self, map: &NodeMap, event: TreeEvent) {
-        self.selection.handle_event(map, event);
+        self.selection.handle_event(map, TreeEvent::RemovedFromForest(node))
     }
 }
 
@@ -769,6 +762,24 @@ mod tests {
 
         assert_eq!(system.window_in_direction(layout, Direction::Right), Some(w(1)));
         assert_eq!(system.window_in_direction(layout, Direction::Left), Some(w(2)));
+    }
+
+    #[test]
+    fn move_focus_raises_only_the_focus_target() {
+        let mut system = BspLayoutSystem::default();
+        let layout = system.create_layout();
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        system.add_window_after_selection(layout, w(3));
+
+        let (focus, raise_windows) = system.move_focus(layout, Direction::Left);
+
+        assert_eq!(focus, Some(w(1)));
+        assert_eq!(
+            raise_windows,
+            vec![w(1)],
+            "BSP windows never overlap; raising the other visible windows fronts every app in turn"
+        );
     }
 
     #[test]
@@ -1066,7 +1077,9 @@ impl LayoutSystem for BspLayoutSystem {
 
             match system.kind.get(node) {
                 Some(NodeKind::Split { orientation, .. }) => rift_protocol::ContainerTreeNode {
+                    node_id: node.data().as_ffi(),
                     node_type: rift_protocol::ContainerNodeType::Container,
+                    frame: Default::default(),
                     layout_kind: Some(rift_protocol::LayoutKind::from(*orientation)),
                     weight,
                     window_id: None,
@@ -1086,11 +1099,13 @@ impl LayoutSystem for BspLayoutSystem {
                     fullscreen_within_gaps,
                     preselected,
                 }) => rift_protocol::ContainerTreeNode {
+                    node_id: node.data().as_ffi(),
                     node_type: if window.is_some() {
                         rift_protocol::ContainerNodeType::Window
                     } else {
                         rift_protocol::ContainerNodeType::Placeholder
                     },
+                    frame: Default::default(),
                     layout_kind: None,
                     weight,
                     window_id: window.map(Into::into),
@@ -1123,7 +1138,7 @@ impl LayoutSystem for BspLayoutSystem {
     ) -> Vec<(WindowId, CGRect)> {
         let mut out = Vec::new();
         if let Some(state) = self.layouts.get(layout).copied() {
-            let rect = Self::apply_outer_gaps(screen, gaps);
+            let rect = compute_tiling_area(screen, gaps);
             self.calculate_layout_recursive(state.root, rect, screen, constraints, gaps, &mut out);
         }
         out
@@ -1192,8 +1207,7 @@ impl LayoutSystem for BspLayoutSystem {
         layout: LayoutId,
         direction: Direction,
     ) -> (Option<WindowId>, Vec<WindowId>) {
-        let raise_windows = self.visible_windows_in_layout(layout);
-        if raise_windows.is_empty() {
+        if self.visible_windows_in_layout(layout).is_empty() {
             return (None, vec![]);
         }
         let sel_snapshot = self.selection_of_layout(layout);
@@ -1209,7 +1223,12 @@ impl LayoutSystem for BspLayoutSystem {
             Some(NodeKind::Leaf { window, .. }) => *window,
             _ => None,
         };
-        (focus, raise_windows)
+        // Tiled BSP windows never overlap, so only the focus target needs to be
+        // raised. Raising every visible window makes the raise manager front
+        // each app in turn (via make_key_window) before the target, which
+        // flickers the menu bar and any focus border on every focus move. The
+        // traditional engine already raises only the revealed group.
+        (focus, focus.into_iter().collect())
     }
 
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId> {
@@ -1276,55 +1295,30 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId> {
-        if let Some(state) = self.layouts.get(layout).copied() {
-            let mut under = Vec::new();
+    fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>) {
+        let current = if let Some(state) = self.layouts.get(layout).copied() {
+            let mut under: Vec<WindowId> = Vec::new();
             self.collect_windows_under(state.root, &mut under);
             under.into_iter().filter(|w| w.pid == pid).collect()
         } else {
             Vec::new()
-        }
-    }
-
-    fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>) {
-        let desired_set: HashSet<WindowId> = desired.iter().copied().collect();
-        let mut current_set: HashSet<WindowId> = HashSet::default();
-        if let Some(state) = self.layouts.get(layout).copied() {
-            let mut under: Vec<WindowId> = Vec::new();
-            self.collect_windows_under(state.root, &mut under);
-            for w in under.into_iter().filter(|w| w.pid == pid) {
-                current_set.insert(w);
-                if !desired_set.contains(&w) {
-                    if let Some(node) = self.node_for_window(w) {
-                        if let Some(NodeKind::Leaf {
-                            fullscreen,
-                            fullscreen_within_gaps,
-                            ..
-                        }) = self.kind.get(node)
-                        {
-                            if *fullscreen || *fullscreen_within_gaps {
-                                continue; // keep fullscreen node in tree
-                            }
-                        }
-                    }
-                    self.remove_window_internal(layout, w);
-                }
+        };
+        let delta = reconcile_app_membership(pid, current, desired);
+        for wid in delta.removals {
+            if let Some(node) = self.node_for_window(wid)
+                && let Some(NodeKind::Leaf {
+                    fullscreen,
+                    fullscreen_within_gaps,
+                    ..
+                }) = self.kind.get(node)
+                && (*fullscreen || *fullscreen_within_gaps)
+            {
+                continue;
             }
+            self.remove_window_internal(layout, wid);
         }
-        for w in desired {
-            if !current_set.contains(&w) {
-                self.add_window_after_selection(layout, w);
-            }
-        }
-    }
-
-    fn has_windows_for_app(&self, layout: LayoutId, pid: pid_t) -> bool {
-        if let Some(state) = self.layouts.get(layout).copied() {
-            let mut under = Vec::new();
-            self.collect_windows_under(state.root, &mut under);
-            under.into_iter().any(|w| w.pid == pid)
-        } else {
-            false
+        for wid in delta.additions {
+            self.add_window_after_selection(layout, wid);
         }
     }
 
@@ -1364,7 +1358,7 @@ impl LayoutSystem for BspLayoutSystem {
                 if !self.belongs_to_layout(state, node) {
                     return;
                 }
-                let tiling = Self::apply_outer_gaps(screen, gaps);
+                let tiling = compute_tiling_area(screen, gaps);
                 let mut fullscreen_transition = false;
                 if let Some(NodeKind::Leaf {
                     window: _,
@@ -1678,24 +1672,6 @@ impl LayoutSystem for BspLayoutSystem {
         }
     }
 
-    fn apply_stacking_to_parent_of_selection(
-        &mut self,
-        _: LayoutId,
-        _: crate::common::config::StackDefaultOrientation,
-    ) -> Vec<WindowId> {
-        vec![]
-    }
-
-    fn parent_of_selection_is_stacked(&self, _layout: LayoutId) -> bool { false }
-
-    fn unstack_parent_of_selection(
-        &mut self,
-        _: LayoutId,
-        _: crate::common::config::StackDefaultOrientation,
-    ) -> Vec<WindowId> {
-        vec![]
-    }
-
     fn unjoin_selection(&mut self, layout: LayoutId) {
         let Some(sel) = self.selection_of_layout(layout) else {
             return;
@@ -1773,8 +1749,6 @@ impl LayoutSystem for BspLayoutSystem {
             node = parent;
         }
     }
-
-    fn rebalance(&mut self, _layout: LayoutId) {}
 
     fn toggle_tile_orientation(&mut self, layout: LayoutId) {
         let sel_snapshot = self.selection_of_layout(layout);

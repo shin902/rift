@@ -1,7 +1,7 @@
 use objc2_core_foundation::CGRect;
 use tracing::{debug, trace};
 
-use crate::actor::app::{Request, WindowId};
+use crate::actor::app::WindowId;
 use crate::actor::reactor::events::EventOutcome;
 use crate::actor::reactor::managers::DragManager;
 use crate::actor::reactor::transaction_manager::TransactionManager;
@@ -40,15 +40,7 @@ pub fn handle_window_created(
         state.windows.track_window_server_info(info);
     }
 
-    let mut window_state: WindowState = window.into();
-    let is_manageable = utils::compute_window_manageability(
-        window_state.info.sys_id,
-        window_state.info.is_minimized,
-        window_state.info.is_standard,
-        window_state.info.is_root,
-        |wsid| state.windows.get_window_server_info(wsid),
-    );
-    window_state.is_manageable = is_manageable;
+    let window_state: WindowState = window.into();
     if let Some(wsid) = window_state.info.sys_id {
         transactions.store_txid(
             wsid,
@@ -58,47 +50,21 @@ pub fn handle_window_created(
     }
 
     state.windows.insert_window(wid, window_state);
+    let _ = utils::refresh_heuristic(state, wid);
 
     let outcome = EventOutcome::window_membership_changed(false, true);
-    Ok(if is_manageable {
-        outcome.with_created_window_finalization(wid)
-    } else {
-        outcome
-    })
+    Ok(
+        if state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission) {
+            outcome.with_created_window_finalization(wid)
+        } else {
+            outcome
+        },
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct WindowDestroyedPayload {
     pub window: WindowId,
-}
-
-pub fn handle_window_ax_invalidated(
-    state: &mut crate::model::RiftState,
-    transactions: &TransactionManager,
-    drag: &mut DragManager,
-    wid: WindowId,
-) -> EventOutcome {
-    if let Some(window_server_id) =
-        state.windows.record(wid).and_then(|record| record.window_server_id())
-    {
-        transactions.remove_for_window(window_server_id);
-    }
-
-    if let DragState::PendingSwap { session, target } = &drag.drag_state
-        && (session.window == wid || *target == wid)
-    {
-        drag.drag_state = DragState::Inactive;
-    }
-    if drag.dragged() == Some(wid) || drag.last_target() == Some(wid) {
-        drag.reset();
-        drag.drag_state = DragState::Inactive;
-    }
-    if drag.skip_layout_for_window == Some(wid) {
-        drag.skip_layout_for_window = None;
-    }
-
-    EventOutcome::window_notification_refresh()
-        .with_app_request(wid.pid, Request::GetVisibleWindows)
 }
 
 pub fn handle_window_destroyed(
@@ -156,7 +122,6 @@ pub fn handle_window_minimized(
             return Ok(crate::actor::reactor::events::EventOutcome::no_change());
         }
         window.info.is_minimized = true;
-        window.is_manageable = false;
         window.info.sys_id
     } else {
         debug!(?wid, "Received WindowMinimized for unknown window - ignoring");
@@ -166,6 +131,7 @@ pub fn handle_window_minimized(
         state.windows.mark_window_hidden(ws_id);
     }
     state.windows.set_visibility(wid, WindowVisibility::Minimized);
+    let _ = utils::refresh_heuristic(state, wid);
     Ok(
         crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
             .with_layout_event(LayoutEvent::WindowRemoved(wid)),
@@ -183,13 +149,12 @@ pub fn handle_window_deminiaturized(
     payload: WindowDeminiaturizedPayload,
 ) -> anyhow::Result<crate::actor::reactor::events::EventOutcome> {
     let WindowDeminiaturizedPayload { window: wid, active_space } = payload;
-    let (server_id, is_ax_standard, is_ax_root) = match state.windows.window_mut(wid) {
+    match state.windows.window_mut(wid) {
         Some(window) => {
             if !window.info.is_minimized {
                 return Ok(crate::actor::reactor::events::EventOutcome::no_change());
             }
             window.info.is_minimized = false;
-            (window.info.sys_id, window.info.is_standard, window.info.is_root)
         }
         None => {
             debug!(
@@ -198,18 +163,14 @@ pub fn handle_window_deminiaturized(
             );
             return Ok(crate::actor::reactor::events::EventOutcome::no_change());
         }
-    };
-    let is_manageable =
-        utils::compute_window_manageability(server_id, false, is_ax_standard, is_ax_root, |wsid| {
-            state.windows.get_window_server_info(wsid)
-        });
-    if let Some(window) = state.windows.window_mut(wid) {
-        window.is_manageable = is_manageable;
     }
+    let _ = utils::refresh_heuristic(state, wid);
     state.windows.set_visibility(wid, WindowVisibility::Visible);
 
     let mut outcome = crate::actor::reactor::events::EventOutcome::no_change();
-    if is_manageable && let Some(space) = active_space {
+    if state.windows.window(wid).is_some_and(WindowState::is_admitted)
+        && let Some(space) = active_space
+    {
         outcome =
             crate::actor::reactor::events::EventOutcome::window_membership_changed(false, false)
                 .with_layout_event(LayoutEvent::WindowAdded(space, wid));
@@ -351,6 +312,20 @@ pub fn handle_window_frame_changed(
     }
     outcome = EventOutcome::layout_changed(false);
 
+    // External moves as well as resizes are authoritative for floating layouts.
+    // Requested frame acknowledgements have already been filtered by the classifier.
+    if let Some(space) = assigned_space.or(old_space)
+        && Some(space) == new_space
+        && let Some(workspace) = layout
+            .layout_engine
+            .virtual_workspace_manager()
+            .workspace_for_window(&state.windows, space, wid)
+        && layout.layout_engine.virtual_workspace_manager().workspaces[workspace].layout_mode()
+            == crate::common::config::LayoutMode::Floating
+    {
+        layout.layout_engine.store_floating_position(space, workspace, wid, new_frame);
+    }
+
     let dragging = mouse_state == Some(MouseState::Down)
         || matches!(
             drag.drag_state,
@@ -373,7 +348,13 @@ pub fn handle_window_frame_changed(
                 },
             };
         }
-        if let DragState::Active { session } = &mut drag.drag_state {
+        // A pending swap is still a live drag: `last_frame` and `settled_space` are
+        // what mouse-up uses to place the window and choose its final space, so
+        // freezing them here strands the window at the position where the swap
+        // candidate was first scored instead of where the user released it.
+        if let DragState::Active { session } | DragState::PendingSwap { session, .. } =
+            &mut drag.drag_state
+        {
             session.last_frame = new_frame;
             session.layout_dirty = true;
             if session.settled_space != new_space {
@@ -391,7 +372,7 @@ pub fn handle_window_frame_changed(
                 });
             }
         } else {
-            outcome = outcome.with_drag_swap_evaluation(wid, new_frame);
+            outcome.drag_swap_evaluations.push((wid, new_frame));
         }
     } else {
         drag.skip_layout_for_window = Some(wid);
@@ -411,7 +392,9 @@ pub fn handle_window_frame_changed(
                     state.windows.set_window_server_space(server, Some(space));
                     state.windows.mark_window_visible(server);
                 }
-                if new_space_active {
+                if new_space_active
+                    && state.windows.window(wid).is_some_and(WindowState::is_admitted)
+                {
                     if let Some(workspace) = layout.layout_engine.active_workspace(space) {
                         let _ = layout
                             .layout_engine
@@ -435,7 +418,7 @@ pub fn handle_window_frame_changed(
     }
 
     if handle_mouse_up_if_needed(drag, false, mouse_state) {
-        outcome = outcome.with_mouse_up_dispatch();
+        outcome.dispatch_mouse_up = true;
     }
     Ok(outcome)
 }
@@ -457,9 +440,10 @@ pub fn handle_window_title_changed(
             return Ok(crate::actor::reactor::events::EventOutcome::no_change());
         }
         window.info.title = new_title.clone();
-        return Ok(crate::actor::reactor::events::EventOutcome::no_change()
-            .with_app_rule_reapply(wid)
-            .with_window_title_broadcast(wid, previous_title, new_title));
+        let mut outcome = crate::actor::reactor::events::EventOutcome::no_change()
+            .with_window_title_broadcast(wid, previous_title, new_title);
+        outcome.reapply_app_rules.push(wid);
+        return Ok(outcome);
     }
     Ok(crate::actor::reactor::events::EventOutcome::no_change())
 }
@@ -495,7 +479,7 @@ pub fn handle_mouse_moved_over_window(
                 raise_windows: vec![vec![window]],
                 focus_window: Some((window, None)),
                 app_handles,
-                focus_quiet: Quiet::No,
+                focus_quiet: Quiet::Yes,
             },
         ));
     }

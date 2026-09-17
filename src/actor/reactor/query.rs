@@ -1,15 +1,77 @@
 use std::sync::mpsc::{RecvError, SyncSender, sync_channel};
 
 use objc2_core_foundation::CGRect;
-use rift_protocol::{ApplicationData, LayoutStateData, WorkspaceLayoutData};
+use rift_protocol::{
+    ApplicationData, ContainerTreeNode, LayoutStateData, Point, Rect, Size, WindowLayoutPosition,
+    WorkspaceLayoutData,
+};
 
 use crate::actor::app::WindowId;
 use crate::actor::menu_bar;
 use crate::actor::reactor::{Event, Reactor, Sender};
-use crate::common::collections::HashSet;
-use crate::model::server::{RuntimeDisplayData, RuntimeWindowData, RuntimeWorkspaceData};
+use crate::common::collections::{HashMap, HashSet};
+use crate::model::server::{
+    RuntimeDisplayData, RuntimeWindowData, RuntimeWorkspaceData, protocol_rect,
+};
 use crate::model::virtual_workspace::VirtualWorkspaceId;
 use crate::sys::screen::{ScreenInfo, SpaceId};
+
+fn union_rect(a: Rect, b: Rect) -> Rect {
+    let x = a.origin.x.min(b.origin.x);
+    let y = a.origin.y.min(b.origin.y);
+    let max_x = (a.origin.x + a.size.width).max(b.origin.x + b.size.width);
+    let max_y = (a.origin.y + a.size.height).max(b.origin.y + b.size.height);
+    Rect {
+        origin: Point { x, y },
+        size: Size {
+            width: max_x - x,
+            height: max_y - y,
+        },
+    }
+}
+
+fn attach_target_frames(
+    node: &mut ContainerTreeNode,
+    window_frames: &HashMap<WindowId, Rect>,
+) -> Option<Rect> {
+    if let Some(window) = node.window_id {
+        node.frame = *window_frames.get(&WindowId::new(window.pid, window.idx))?;
+        return Some(node.frame);
+    }
+
+    node.frame = node
+        .children
+        .iter_mut()
+        .filter_map(|child| attach_target_frames(child, window_frames))
+        .reduce(union_rect)?;
+    Some(node.frame)
+}
+
+fn propagate_single_child_allocations(node: &mut ContainerTreeNode) {
+    if let [child] = node.children.as_mut_slice()
+        && child.window_id.is_none()
+    {
+        child.frame = node.frame;
+    }
+    node.children.iter_mut().for_each(propagate_single_child_allocations);
+}
+
+fn logical_window_positions(tree: &ContainerTreeNode) -> HashMap<WindowId, WindowLayoutPosition> {
+    tree.children
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| column.role.as_deref() == Some("column"))
+        .flat_map(|(column, node)| {
+            node.children.iter().enumerate().filter_map(move |(row, node)| {
+                let window = node.window_id?;
+                Some((WindowId::new(window.pid, window.idx), WindowLayoutPosition {
+                    column,
+                    row,
+                }))
+            })
+        })
+        .collect()
+}
 
 #[derive(Clone)]
 pub struct ReactorQueryHandle {
@@ -159,43 +221,13 @@ impl Reactor {
     #[cfg(test)]
     pub(crate) fn test_default_query_space(&self) -> Option<SpaceId> { self.default_query_space() }
 
-    pub fn query_workspaces(&mut self, space_id: Option<SpaceId>) -> Vec<RuntimeWorkspaceData> {
-        self.handle_workspace_query(space_id)
+    pub fn query_space_for_display(&self, display_uuid: &str) -> Option<SpaceId> {
+        self.space_state
+            .screens
+            .iter()
+            .find(|screen| screen.display_uuid == display_uuid)
+            .and_then(|screen| screen.space)
     }
-
-    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
-        self.handle_windows_query(space_id)
-    }
-
-    pub fn query_active_workspace(&self, space_id: Option<SpaceId>) -> Option<VirtualWorkspaceId> {
-        self.handle_active_workspace_query(space_id)
-    }
-
-    pub fn query_displays(&self) -> Vec<RuntimeDisplayData> { self.handle_displays_query() }
-
-    pub fn query_workspace_layouts(
-        &mut self,
-        space_id: Option<SpaceId>,
-        workspace_id: Option<usize>,
-    ) -> Vec<WorkspaceLayoutData> {
-        self.handle_workspace_layouts_query(space_id, workspace_id)
-    }
-
-    pub fn query_window_info(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
-        self.handle_window_info_query(window_id)
-    }
-
-    pub fn query_applications(&self) -> Vec<ApplicationData> { self.handle_applications_query() }
-
-    pub fn query_layout_state(
-        &self,
-        space_id: Option<u64>,
-        workspace_id: Option<usize>,
-    ) -> Option<LayoutStateData> {
-        self.handle_layout_state_query(space_id, workspace_id)
-    }
-
-    pub fn query_metrics(&self) -> serde_json::Value { self.handle_metrics_query() }
 
     pub(super) fn maybe_send_menu_update(&mut self) {
         let menu_tx = match self.menu_manager.menu_tx.as_ref() {
@@ -203,17 +235,18 @@ impl Reactor {
             None => return,
         };
 
-        let active_space = match self.menu_bar_space() {
-            Some(space) => space,
-            None => return,
-        };
+        let active_space =
+            match self.resolve_menu_bar_space_with_preferred(self.space_state.menu_bar_space) {
+                Some(space) => space,
+                None => return,
+            };
 
-        let workspaces = self.handle_workspace_query(Some(active_space));
+        let workspaces = self.query_workspaces(Some(active_space));
         let active_space_is_activated = self.is_space_active(active_space);
         let active_workspace = self.layout_manager.layout_engine.active_workspace(active_space);
         let active_workspace_idx =
             self.layout_manager.layout_engine.active_workspace_idx(active_space);
-        let windows = self.handle_windows_query(Some(active_space));
+        let windows = self.query_windows(Some(active_space));
 
         menu_tx.send(menu_bar::Event::Update(menu_bar::Update {
             active_space,
@@ -223,10 +256,6 @@ impl Reactor {
             active_workspace,
             windows,
         }));
-    }
-
-    fn menu_bar_space(&self) -> Option<SpaceId> {
-        self.resolve_menu_bar_space_with_preferred(self.space_state.menu_bar_space)
     }
 
     fn resolve_menu_bar_space_with_preferred(
@@ -248,7 +277,7 @@ impl Reactor {
         self.resolve_menu_bar_space_with_preferred(preferred_space)
     }
 
-    fn handle_workspace_query(
+    pub fn query_workspaces(
         &mut self,
         space_id_param: Option<SpaceId>,
     ) -> Vec<RuntimeWorkspaceData> {
@@ -320,9 +349,19 @@ impl Reactor {
             let predicted_map: std::collections::HashMap<WindowId, CGRect> =
                 predicted_positions.into_iter().collect();
 
+            let logical_positions = space_id
+                .and_then(|space| {
+                    self.layout_manager.layout_engine.query_workspace_layout(space, Some(index))
+                })
+                .map(|snapshot| logical_window_positions(&snapshot.container_tree))
+                .unwrap_or_default();
+
             let mut windows: Vec<RuntimeWindowData> = Vec::new();
             for wid in workspace_windows_ids.into_iter() {
                 if let Some(mut wd) = self.create_window_data(wid) {
+                    if !wd.is_floating {
+                        wd.layout_position = logical_positions.get(&wid).copied();
+                    }
                     if !is_active {
                         if let Some(pred) = predicted_map.get(&wid).copied() {
                             wd.info.frame = pred;
@@ -331,6 +370,13 @@ impl Reactor {
                     windows.push(wd);
                 }
             }
+            // Scrolling windows are returned in their logical visual order. Floating and
+            // non-column layouts retain their existing stable membership order afterward.
+            windows.sort_by_key(|window| {
+                window.layout_position.map_or((1, usize::MAX, usize::MAX), |position| {
+                    (0, position.column, position.row)
+                })
+            });
 
             let layout_mode = space_id
                 .and_then(|space| {
@@ -356,7 +402,7 @@ impl Reactor {
         workspaces
     }
 
-    fn handle_workspace_layouts_query(
+    pub fn query_workspace_layouts(
         &mut self,
         space_id_param: Option<SpaceId>,
         workspace_id: Option<usize>,
@@ -395,7 +441,7 @@ impl Reactor {
             .collect()
     }
 
-    fn handle_active_workspace_query(
+    pub fn query_active_workspace(
         &self,
         space_id_param: Option<SpaceId>,
     ) -> Option<VirtualWorkspaceId> {
@@ -403,7 +449,7 @@ impl Reactor {
         self.layout_manager.layout_engine.active_workspace(space_id)
     }
 
-    fn handle_displays_query(&self) -> Vec<RuntimeDisplayData> {
+    pub fn query_displays(&self) -> Vec<RuntimeDisplayData> {
         let active_context_space = self.active_display_space();
         let active_space_ids = self.active_space_ids();
         let active_space_set: HashSet<u64> = active_space_ids.iter().copied().collect();
@@ -447,7 +493,7 @@ impl Reactor {
             .collect()
     }
 
-    fn handle_windows_query(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
+    pub fn query_windows(&self, space_id: Option<SpaceId>) -> Vec<RuntimeWindowData> {
         let target_space = space_id.or_else(|| self.default_query_space());
 
         if let Some(space) = target_space {
@@ -470,11 +516,11 @@ impl Reactor {
         }
     }
 
-    fn handle_window_info_query(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
+    pub fn query_window_info(&self, window_id: WindowId) -> Option<RuntimeWindowData> {
         self.create_window_data(window_id)
     }
 
-    fn handle_applications_query(&self) -> Vec<ApplicationData> {
+    pub fn query_applications(&self) -> Vec<ApplicationData> {
         self.app_manager
             .apps
             .iter()
@@ -498,7 +544,7 @@ impl Reactor {
             .collect()
     }
 
-    fn handle_layout_state_query(
+    pub fn query_layout_state(
         &self,
         space_id_u64: Option<u64>,
         workspace_id: Option<usize>,
@@ -511,10 +557,30 @@ impl Reactor {
             return None;
         }
 
-        let snapshot = self
+        let mut snapshot = self
             .layout_manager
             .layout_engine
             .query_workspace_layout(space_id, workspace_id)?;
+        let screen = self.space_state.screen_by_space(space_id)?;
+        let display_uuid = screen.display_uuid_owned();
+        let gaps = self.config.settings.layout.gaps.effective_for_display(display_uuid.as_deref());
+        let target_frames = self.layout_manager.layout_engine.calculate_workspace_layout(
+            space_id,
+            snapshot.workspace_id,
+            screen.frame,
+            &gaps,
+            self.config.settings.ui.stack_line.thickness(),
+            self.config.settings.ui.stack_line.horiz_placement,
+            self.config.settings.ui.stack_line.vert_placement,
+        );
+        let target_frames: HashMap<WindowId, Rect> = target_frames
+            .into_iter()
+            .map(|(window, frame)| (window, protocol_rect(frame)))
+            .collect();
+        let tiling_area = crate::layout_engine::utils::compute_tiling_area(screen.frame, &gaps);
+        attach_target_frames(&mut snapshot.container_tree, &target_frames);
+        snapshot.container_tree.frame = protocol_rect(tiling_area);
+        propagate_single_child_allocations(&mut snapshot.container_tree);
         let workspace_windows = self
             .layout_manager
             .layout_engine
@@ -547,7 +613,7 @@ impl Reactor {
         })
     }
 
-    fn handle_metrics_query(&self) -> serde_json::Value {
+    pub fn query_metrics(&self) -> serde_json::Value {
         let stats = self
             .layout_manager
             .layout_engine

@@ -6,6 +6,8 @@ pub mod accessibility;
 pub mod app;
 pub mod axuielement;
 pub mod carbon;
+#[cfg(feature = "custom-event-loop")]
+mod cocoa;
 
 pub mod cgs_window;
 pub mod dispatch;
@@ -16,6 +18,7 @@ pub mod event;
 pub mod event_tap;
 pub mod executor;
 pub mod geometry;
+pub mod gesture;
 pub mod haptics;
 pub mod hotkey;
 pub mod mach;

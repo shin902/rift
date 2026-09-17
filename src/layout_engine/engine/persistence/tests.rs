@@ -4,8 +4,8 @@ use super::*;
 use crate::actor::app::WindowInfo;
 use crate::common::config::LayoutMode;
 use crate::layout_engine::{LayoutEvent, LayoutSystemKind};
-use crate::model::VirtualWorkspace;
 use crate::model::reactor::WindowState;
+use crate::model::{AppRuleResult, VirtualWorkspace};
 use crate::sys::window_server::WindowServerId;
 
 fn test_engine() -> LayoutEngine {
@@ -81,6 +81,88 @@ fn identity_transfer_preserves_window_tree_position_and_fingerprint() {
 }
 
 #[test]
+fn restored_workspace_is_resolved_before_app_rule_assignment() {
+    let settings = VirtualWorkspaceSettings {
+        app_rules: vec![crate::common::config::AppWorkspaceRule {
+            app_id: Some("com.example.terminal".into()),
+            workspace: Some(crate::common::config::WorkspaceSelector::Index(0)),
+            manage: Some(true),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = LayoutEngine::new(&settings, &LayoutSettings::default(), None);
+    let mut window_store = WindowStore::default();
+    let space = SpaceId::new(78);
+    let window = WindowId::new(10, 3);
+    let frame = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(0.0, 0.0),
+        CGSize::new(800.0, 600.0),
+    );
+    let _ = engine.handle_event(
+        &mut window_store,
+        LayoutEvent::SpaceExposed(space, CGSize::new(1200.0, 800.0)),
+    );
+    let restored_workspace = engine.virtual_workspace_manager.list_workspaces(space)[1].0;
+    let restored_layout = engine.workspace_layouts.active(space, restored_workspace).unwrap();
+    engine
+        .workspace_tree_mut(restored_workspace)
+        .add_window_after_selection(restored_layout, window);
+    engine.persistence.windows.insert(window, WindowFingerprint {
+        window_server_id: Some(7803),
+        title: Some("Restored terminal".into()),
+        width: 800.0,
+        height: 600.0,
+        app_id: Some("com.example.terminal".into()),
+    });
+    engine.persistence.pending_windows.insert(window);
+    window_store.insert_window(window, WindowState {
+        info: WindowInfo {
+            is_standard: true,
+            is_root: true,
+            is_minimized: false,
+            is_resizable: true,
+            min_size: None,
+            max_size: None,
+            title: "Restored terminal".into(),
+            frame,
+            sys_id: Some(WindowServerId::new(7803)),
+            bundle_id: Some("com.example.terminal".into()),
+            path: None,
+            ax_role: None,
+            ax_subrole: None,
+        },
+        frame_monotonic: frame,
+        is_manageable: true,
+        manage_override: None,
+    });
+
+    let result = engine
+        .assign_window_with_app_info(
+            &mut window_store,
+            window,
+            space,
+            Some("com.example.terminal"),
+            Some("Terminal"),
+            Some("Restored terminal"),
+            None,
+            None,
+        )
+        .unwrap();
+    let AppRuleResult::Managed(effects) = result else {
+        panic!("restored live window should be managed")
+    };
+
+    assert_eq!(effects.workspace_id, restored_workspace);
+    assert_eq!(
+        engine
+            .virtual_workspace_manager
+            .workspace_for_window(&window_store, space, window),
+        Some(restored_workspace)
+    );
+}
+
+#[test]
 fn save_and_load_arms_fingerprint_reconciliation() {
     let mut engine = test_engine();
     let window = WindowId::new(42, 7);
@@ -151,7 +233,7 @@ fn full_save_records_floating_window_in_its_inactive_workspace() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -212,7 +294,7 @@ fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -481,7 +563,7 @@ fn workspace_restore_keeps_current_windows_absent_from_snapshot() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     };
     window_store.insert_window(live, live_state("Live", "com.example.live", 7101));
     window_store.insert_window(
@@ -594,7 +676,7 @@ fn scoped_restore_does_not_consume_same_id_live_window_on_another_space() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -703,7 +785,7 @@ fn space_restore_uses_workspace_assignment_over_stale_window_server_space() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -804,7 +886,7 @@ fn workspace_restore_does_not_consume_live_window_from_sibling_workspace() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -893,7 +975,7 @@ fn workspace_restore_preserves_live_window_when_saved_process_local_id_is_reused
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -976,11 +1058,12 @@ fn completed_app_discovery_discards_unmatched_startup_ghosts() {
     engine.floating.set_last_focus(Some(ghost));
     assert!(engine.workspace_tree(workspace).contains_window(layout, ghost));
 
-    let _ = engine.handle_event(
+    let completion = engine.handle_event(
         &mut window_store,
         LayoutEvent::WindowDiscoveryCompleted(ghost.pid, None, vec![space]),
     );
 
+    assert!(completion.response.changed);
     assert!(!engine.workspace_tree(workspace).contains_window(layout, ghost));
     assert!(!engine.persistence.windows.contains_key(&ghost));
     assert!(!engine.persistence.pending_windows.contains(&ghost));
@@ -1592,7 +1675,7 @@ fn reused_direct_window_identity_cannot_cross_known_application_identity() {
 }
 
 #[test]
-fn fuzzy_match_requires_window_specific_evidence() {
+fn fuzzy_match_requires_known_app_and_title_but_not_size() {
     use super::matcher::{RestoreCandidate, choose_match};
 
     let saved = WindowId::new(42, 7);
@@ -1624,7 +1707,11 @@ fn fuzzy_match_requires_window_specific_evidence() {
         title: Some("Music".into()),
         ..unrelated_live
     };
-    assert!(choose_match(live, space, &title_only_match, None, &candidate).is_none());
+    assert_eq!(
+        choose_match(live, space, &title_only_match, None, &candidate)
+            .map(|decision| decision.selected),
+        Some(saved)
+    );
 
     let title_and_size_match = WindowFingerprint {
         width: 500.0,
@@ -1663,6 +1750,84 @@ fn fuzzy_match_requires_window_specific_evidence() {
         )
         .is_none()
     );
+}
+
+#[test]
+fn fuzzy_match_uses_size_to_disambiguate_duplicate_app_titles() {
+    use super::matcher::{RestoreCandidate, choose_match};
+
+    let near = WindowId::new(42, 7);
+    let far = WindowId::new(42, 8);
+    let live = WindowId::new(99, 1);
+    let space = SpaceId::new(503);
+    let near_fingerprint = WindowFingerprint {
+        window_server_id: None,
+        title: Some("Project".into()),
+        width: 800.0,
+        height: 600.0,
+        app_id: Some("com.example.editor".into()),
+    };
+    let far_fingerprint = WindowFingerprint {
+        width: 1200.0,
+        height: 900.0,
+        ..near_fingerprint.clone()
+    };
+    let live_fingerprint = WindowFingerprint {
+        width: 850.0,
+        height: 650.0,
+        ..near_fingerprint.clone()
+    };
+    let workspace = crate::model::VirtualWorkspaceId::default();
+    let candidates = [
+        RestoreCandidate {
+            window: far,
+            fingerprint: &far_fingerprint,
+            location: Some((space, workspace)),
+        },
+        RestoreCandidate {
+            window: near,
+            fingerprint: &near_fingerprint,
+            location: Some((space, workspace)),
+        },
+    ];
+
+    assert_eq!(
+        choose_match(live, space, &live_fingerprint, None, &candidates)
+            .map(|decision| decision.selected),
+        Some(near)
+    );
+}
+
+#[test]
+fn fuzzy_match_rejects_equal_size_ambiguity_for_duplicate_app_titles() {
+    use super::matcher::{RestoreCandidate, choose_match};
+
+    let first = WindowId::new(42, 7);
+    let second = WindowId::new(42, 8);
+    let live = WindowId::new(99, 1);
+    let space = SpaceId::new(504);
+    let fingerprint = WindowFingerprint {
+        window_server_id: None,
+        title: Some("Project".into()),
+        width: 800.0,
+        height: 600.0,
+        app_id: Some("com.example.editor".into()),
+    };
+    let workspace = crate::model::VirtualWorkspaceId::default();
+    let candidates = [
+        RestoreCandidate {
+            window: first,
+            fingerprint: &fingerprint,
+            location: Some((space, workspace)),
+        },
+        RestoreCandidate {
+            window: second,
+            fingerprint: &fingerprint,
+            location: Some((space, workspace)),
+        },
+    ];
+
+    assert!(choose_match(live, space, &fingerprint, None, &candidates).is_none());
 }
 
 #[test]
@@ -1740,10 +1905,9 @@ fn space_restore_rejects_workspace_count_mismatch_before_mutating_layouts() {
         .add_window_after_selection(target_layout, sentinel);
 
     let error = engine
-        .restore_saved_layout(
+        .restore_layout(
             path.clone(),
-            RestoreScope::Space,
-            space,
+            RestoreRequest::new(RestoreScope::Space, space),
             &mut window_store,
             &VirtualWorkspaceSettings::default(),
             &LayoutSettings::default(),
@@ -1829,6 +1993,7 @@ fn every_layout_system_round_trips_through_ron() {
         LayoutMode::Stack,
         LayoutMode::MasterStack,
         LayoutMode::Scrolling,
+        LayoutMode::Floating,
     ] {
         let system = VirtualWorkspace::create_layout_system(mode, &settings);
         let serialized = ron::ser::to_string(&system).unwrap();

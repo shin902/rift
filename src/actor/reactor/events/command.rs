@@ -30,6 +30,7 @@ pub struct LayoutCommandPayload {
     pub workspace_target_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
     pub visible_space_centers: HashMap<SpaceId, objc2_core_foundation::CGPoint>,
+    pub post_arrange_mouse_warp: Option<WindowId>,
 }
 
 pub fn handle_command_layout(
@@ -44,8 +45,11 @@ pub fn handle_command_layout(
         workspace_target_space,
         visible_spaces,
         visible_space_centers,
+        post_arrange_mouse_warp,
     } = payload;
     info!(?cmd);
+    let is_move_node = matches!(cmd, LayoutCommand::MoveNode(_));
+    let is_selection_command = matches!(cmd, LayoutCommand::Ascend | LayoutCommand::Descend);
     let is_workspace_switch = matches!(
         cmd,
         LayoutCommand::NextWorkspace(_)
@@ -76,6 +80,17 @@ pub fn handle_command_layout(
     );
     let is_explicit_move = workspace_target_space.is_some()
         && matches!(&cmd, LayoutCommand::MoveWindowToWorkspace { .. });
+    if matches!(
+        cmd,
+        LayoutCommand::JoinWindow(_)
+            | LayoutCommand::ToggleStack
+            | LayoutCommand::ConsumeOrExpelWindow(_)
+    ) && let Some(space) = command_space
+        && layout.layout_engine.active_layout_mode_at(space)
+            == crate::common::config::LayoutMode::Floating
+    {
+        store_current_floating_positions(state, layout, space);
+    }
     let workspace_space = if requires_workspace_space {
         let target_space = workspace_target_space.or(command_space);
         if let Some(space) = target_space {
@@ -151,6 +166,7 @@ pub fn handle_command_layout(
         return Ok(EventOutcome::no_change());
     }
 
+    let selection_changed = is_selection_command && response.changed;
     let arrange_space_scope = if is_explicit_move {
         // A cross-display move removes the window from the source display too;
         // arranging all active spaces lets the source reflow immediately.
@@ -158,32 +174,36 @@ pub fn handle_command_layout(
     } else {
         is_workspace_switch.then_some(workspace_space).flatten()
     };
-    Ok(EventOutcome::layout_changed(false)
+    let mut outcome = EventOutcome::layout_changed(false)
         .with_layout_response(response, workspace_space)
-        .with_arrange_space_scope(arrange_space_scope))
+        .with_arrange_space_scope(arrange_space_scope);
+    outcome.broadcast_selection_changed = selection_changed;
+    if is_move_node && let Some(window) = post_arrange_mouse_warp {
+        outcome.post_arrange_mouse_warp = Some(window);
+    }
+    Ok(outcome)
 }
 
 fn current_floating_positions(
     state: &RiftState,
     layout: &LayoutManager,
     space: SpaceId,
-) -> Vec<(SpaceId, WindowId, objc2_core_foundation::CGRect)> {
+) -> Vec<(WindowId, objc2_core_foundation::CGRect)> {
+    let floats_by_layout = layout.layout_engine.active_layout_mode_at(space)
+        == crate::common::config::LayoutMode::Floating;
     layout
         .layout_engine
         .windows_in_active_workspace(&state.windows, space)
         .into_iter()
-        .filter(|window| layout.layout_engine.is_window_floating(*window))
+        .filter(|window| floats_by_layout || layout.layout_engine.is_window_floating(*window))
         .filter_map(|window| {
-            state.windows.window(window).map(|state| (space, window, state.frame_monotonic))
+            state.windows.window(window).map(|state| (window, state.frame_monotonic))
         })
         .collect()
 }
 
 fn store_current_floating_positions(state: &RiftState, layout: &mut LayoutManager, space: SpaceId) {
-    let positions = current_floating_positions(state, layout, space)
-        .into_iter()
-        .map(|(_, window, frame)| (window, frame))
-        .collect::<Vec<_>>();
+    let positions = current_floating_positions(state, layout, space);
     if !positions.is_empty() {
         layout.layout_engine.store_floating_window_positions(space, &positions);
     }
@@ -197,13 +217,19 @@ pub fn handle_command_metrics(cmd: MetricsCommand) -> anyhow::Result<EventOutcom
 pub fn handle_switch_native_space(
     direction: crate::layout_engine::Direction,
 ) -> anyhow::Result<EventOutcome> {
-    Ok(EventOutcome::no_change().with_native_space_switch(direction))
+    Ok(EventOutcome {
+        switch_native_space: Some(direction),
+        ..EventOutcome::default()
+    })
 }
 
 pub fn handle_mission_control_command(
     command: crate::actor::wm_controller::WmCmd,
 ) -> anyhow::Result<EventOutcome> {
-    Ok(EventOutcome::no_change().with_wm_command(command))
+    Ok(EventOutcome {
+        wm_commands: vec![command],
+        ..EventOutcome::default()
+    })
 }
 
 pub fn handle_close_window(
@@ -228,7 +254,10 @@ pub fn handle_config_updated(
 
     drag.update_config(config.settings.window_snapping);
 
-    Ok(EventOutcome::layout_changed(false).with_service_config_update(config.clone()))
+    Ok(EventOutcome {
+        service_config_update: Some(config.clone()),
+        ..EventOutcome::layout_changed(false)
+    })
 }
 
 pub fn handle_command_reactor_debug(
@@ -300,10 +329,13 @@ pub fn handle_command_reactor_toggle_space_activated(
     let Some(space) = payload.space else {
         return Ok(EventOutcome::no_change());
     };
-    policy.toggle_space_activated(payload.config, ToggleSpaceContext {
-        space,
-        display_uuid: payload.display_uuid,
-    });
+    policy.toggle_space_activated(
+        payload.config,
+        ToggleSpaceContext {
+            space,
+            display_uuid: payload.display_uuid,
+        },
+    );
     Ok(EventOutcome::layout_changed(false).with_active_space_recompute())
 }
 
@@ -320,9 +352,28 @@ pub struct DisplayFocusPayload {
     pub screen: Option<ScreenInfo>,
     pub target_is_active: bool,
     pub focus_window: Option<WindowId>,
+    /// Center of `focus_window`'s frame, used to warp the cursor onto the
+    /// window that receives focus. Falls back to the screen center.
+    pub focus_window_center: Option<objc2_core_foundation::CGPoint>,
 }
 
-pub fn handle_move_mouse_to_display(payload: DisplayFocusPayload) -> anyhow::Result<EventOutcome> {
+fn focus_window_raise_request(apps: &AppManager, window: WindowId) -> raise_manager::Event {
+    let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
+    if let Some(app) = apps.apps.get(&window.pid) {
+        app_handles.insert(window.pid, app.handle.clone());
+    }
+    raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
+        raise_windows: Vec::new(),
+        focus_window: Some((window, None)),
+        app_handles,
+        focus_quiet: Quiet::Yes,
+    })
+}
+
+pub fn handle_move_mouse_to_display(
+    apps: &AppManager,
+    payload: DisplayFocusPayload,
+) -> anyhow::Result<EventOutcome> {
     let Some(screen) = payload.screen else {
         return Ok(EventOutcome::no_change());
     };
@@ -332,12 +383,17 @@ pub fn handle_move_mouse_to_display(payload: DisplayFocusPayload) -> anyhow::Res
     }
     let mut outcome = EventOutcome::focus_changed(None, false).with_mouse_warp(screen.frame.mid());
     if let (Some(space), Some(window)) = (screen.space, payload.focus_window) {
-        outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window));
+        outcome = outcome
+            .with_layout_event(LayoutEvent::WindowFocused(space, window))
+            .with_raise_request(focus_window_raise_request(apps, window));
     }
     Ok(outcome)
 }
 
-pub fn handle_focus_display(payload: DisplayFocusPayload) -> anyhow::Result<EventOutcome> {
+pub fn handle_focus_display(
+    apps: &AppManager,
+    payload: DisplayFocusPayload,
+) -> anyhow::Result<EventOutcome> {
     let Some(screen) = payload.screen else {
         return Ok(EventOutcome::no_change());
     };
@@ -347,7 +403,9 @@ pub fn handle_focus_display(payload: DisplayFocusPayload) -> anyhow::Result<Even
     }
     if let (Some(space), Some(window)) = (screen.space, payload.focus_window) {
         return Ok(EventOutcome::focus_changed(None, false)
-            .with_layout_event(LayoutEvent::WindowFocused(space, window)));
+            .with_layout_event(LayoutEvent::WindowFocused(space, window))
+            .with_raise_request(focus_window_raise_request(apps, window))
+            .with_mouse_warp(payload.focus_window_center.unwrap_or_else(|| screen.frame.mid())));
     }
     Ok(EventOutcome::focus_changed(None, false).with_mouse_warp(screen.frame.mid()))
 }
@@ -375,19 +433,9 @@ pub fn handle_command_reactor_focus_window(
         }
         outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window_id));
 
-        let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
-        if let Some(app) = apps.apps.get(&window_id.pid) {
-            app_handles.insert(window_id.pid, app.handle.clone());
-        }
-        let request = raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
-            raise_windows: Vec::new(),
-            focus_window: Some((window_id, None)),
-            app_handles,
-            focus_quiet: Quiet::No,
-        });
-        outcome = outcome.with_raise_request(request);
+        outcome = outcome.with_raise_request(focus_window_raise_request(apps, window_id));
     } else if let Some(wsid) = window_server_id {
-        outcome = outcome.with_make_key_window(window_id.pid, wsid);
+        outcome.make_key_windows.push((window_id.pid, wsid));
     }
     Ok(outcome)
 }
@@ -437,4 +485,86 @@ pub fn handle_command_reactor_move_window_to_display(
     Ok(EventOutcome::layout_changed(false)
         .with_layout_response(response, None)
         .with_pre_layout_window_frame_write(payload.window, payload.target_frame, true))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceWindowMove {
+    pub window: WindowId,
+    pub window_server_id: Option<WindowServerId>,
+    pub target_frame: objc2_core_foundation::CGRect,
+}
+
+#[derive(Debug, Clone)]
+pub struct MoveWorkspaceToDisplayPayload {
+    pub windows: Vec<WorkspaceWindowMove>,
+    pub source_space: SpaceId,
+    pub target_space: SpaceId,
+    pub target_screen: objc2_core_foundation::CGRect,
+}
+
+pub fn handle_command_reactor_move_workspace_to_display(
+    state: &mut RiftState,
+    layout: &mut LayoutManager,
+    workspace_switch: &mut WorkspaceSwitchManager,
+    payload: MoveWorkspaceToDisplayPayload,
+) -> anyhow::Result<EventOutcome> {
+    let MoveWorkspaceToDisplayPayload {
+        windows,
+        source_space,
+        target_space,
+        target_screen,
+    } = payload;
+
+    let moves = windows
+        .into_iter()
+        .filter(|window_move| {
+            if state.windows.window(window_move.window).is_some() {
+                true
+            } else {
+                warn!(
+                    window = ?window_move.window,
+                    "Skipping unknown window in workspace display move"
+                );
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+    let window_ids = moves.iter().map(|window_move| window_move.window).collect::<Vec<_>>();
+    let response = layout.layout_engine.move_active_workspace_to_space(
+        &mut state.windows,
+        source_space,
+        target_space,
+        target_screen.size,
+        &window_ids,
+    );
+    if !response.changed {
+        return Ok(EventOutcome::no_change());
+    }
+
+    let mut applied_moves = Vec::with_capacity(moves.len());
+    for window_move in moves {
+        if state.windows.workspace_for_window(target_space, window_move.window).is_none() {
+            continue;
+        }
+        if let Some(window) = state.windows.window_mut(window_move.window) {
+            window.frame_monotonic = window_move.target_frame;
+        }
+        if let Some(window_server_id) = window_move.window_server_id {
+            state.windows.set_window_server_space(window_server_id, Some(target_space));
+            state.windows.mark_window_visible(window_server_id);
+        }
+        applied_moves.push(window_move);
+    }
+
+    workspace_switch.start_workspace_switch(WorkspaceSwitchOrigin::Manual);
+    let mut outcome =
+        EventOutcome::layout_changed(false).with_layout_response(response, Some(target_space));
+    for window_move in applied_moves {
+        outcome = outcome.with_pre_layout_window_frame_write(
+            window_move.window,
+            window_move.target_frame,
+            true,
+        );
+    }
+    Ok(outcome)
 }

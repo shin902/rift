@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 #[derive(Parser)]
+#[command(version = env!("RIFT_VERSION"))]
 #[command(name = "rift-cli")]
 #[command(about = "Command-line interface for rift window manager")]
 struct Cli {
@@ -69,13 +70,19 @@ enum ServiceCommands {
 enum QueryCommands {
     /// List virtual workspaces (optionally for a specific MacOS space)
     Workspaces {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "display")]
         space_id: Option<u64>,
+        /// Display UUID; queries the display's current macOS space
+        #[arg(long, value_name = "UUID", conflicts_with = "space_id")]
+        display: Option<String>,
     },
     /// List windows (optionally filtered by space)
     Windows {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "display")]
         space_id: Option<u64>,
+        /// Display UUID; queries the display's current macOS space
+        #[arg(long, value_name = "UUID", conflicts_with = "space_id")]
+        display: Option<String>,
     },
     /// List connected displays
     Displays,
@@ -211,7 +218,10 @@ enum WindowCommands {
     /// Examples:
     ///   rift-cli execute window resize-by --amount 0.05    # grow by 5%
     ///   rift-cli execute window resize-by --amount -0.10   # shrink by 10%
-    ResizeBy { amount: f64 },
+    ResizeBy {
+        #[arg(long)]
+        amount: f64,
+    },
     /// Close a window as if Command-W was pressed
     Close {
         /// Optional window server ID; defaults to the focused window
@@ -320,7 +330,7 @@ enum WorkspaceCommands {
         /// Target display UUID. When omitted, use Rift's existing command context.
         #[arg(long = "display-uuid")]
         display_uuid: Option<String>,
-        /// Layout mode: traditional, bsp, stack, master_stack, scrolling
+        /// Layout mode: traditional, bsp, stack, master_stack, scrolling, floating
         mode: String,
     },
 }
@@ -367,54 +377,47 @@ enum LayoutCommands {
 #[derive(Subcommand)]
 enum ConfigCommands {
     /// Update animation settings
-    SetAnimate {
-        value: String,
-    },
-    SetAnimationDuration {
-        value: f64,
-    },
-    SetAnimationFps {
-        value: f64,
-    },
-    SetAnimationEasing {
-        value: String,
-    },
+    SetAnimate { value: String },
+    /// Set the animation duration in seconds
+    SetAnimationDuration { value: f64 },
+    /// Set the animation frame rate
+    SetAnimationFps { value: f64 },
+    /// Set the animation easing curve
+    SetAnimationEasing { value: String },
 
     /// Update mouse settings
     SetMouseFollowsFocus {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
+    /// Show or hide the pointer after focus changes
     SetMouseHidesOnFocus {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
+    /// Enable or disable focusing windows under the pointer
     SetFocusFollowsMouse {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
 
     /// Update layout settings
-    SetStackOffset {
-        value: f64,
-    },
+    SetStackOffset { value: f64 },
     /// Set the default stack orientation behavior. Value should be one of:
     /// "perpendicular", "same", "horizontal", or "vertical"
-    SetStackDefaultOrientation {
-        value: String,
-    },
+    SetStackDefaultOrientation { value: String },
+    /// Set the outer gap on each screen edge
     SetOuterGaps {
         top: f64,
         left: f64,
         bottom: f64,
         right: f64,
     },
-    SetInnerGaps {
-        horizontal: f64,
-        vertical: f64,
-    },
+    /// Set the horizontal and vertical gaps between windows
+    SetInnerGaps { horizontal: f64, vertical: f64 },
 
     /// Update workspace settings
-    SetWorkspaceNames {
-        names: Vec<String>,
-    },
+    SetWorkspaceNames { names: Vec<String> },
 
     /// Generic set: set an arbitrary config key (dot-separated path) to a JSON value.
     /// Example: rift-cli execute config set --key settings.animate --value true
@@ -484,6 +487,21 @@ enum DisplayCommands {
         /// Optional window id (window idx); defaults to the focused window if omitted.
         #[arg(long)]
         window_id: Option<u32>,
+    },
+    /// Move the active workspace to a display by direction, index, or UUID.
+    MoveWorkspace {
+        /// Direction relative to the workspace's current display (left, right, up, down).
+        #[arg(long)]
+        direction: Option<String>,
+        /// Display index (0-based).
+        #[arg(long)]
+        index: Option<usize>,
+        /// Display UUID.
+        #[arg(long)]
+        uuid: Option<String>,
+        /// Continue from the opposite edge for directional selectors.
+        #[arg(long)]
+        wrap_around: bool,
     },
 }
 
@@ -604,8 +622,14 @@ fn build_request(command: Commands) -> Result<RiftRequest, String> {
 
 fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
     match query {
-        QueryCommands::Workspaces { space_id } => Ok(RiftRequest::GetWorkspaces { space_id }),
-        QueryCommands::Windows { space_id } => Ok(RiftRequest::GetWindows { space_id }),
+        QueryCommands::Workspaces { space_id, display } => match display {
+            Some(display_uuid) => Ok(RiftRequest::GetWorkspacesForDisplay { display_uuid }),
+            None => Ok(RiftRequest::GetWorkspaces { space_id }),
+        },
+        QueryCommands::Windows { space_id, display } => match display {
+            Some(display_uuid) => Ok(RiftRequest::GetWindowsForDisplay { display_uuid }),
+            None => Ok(RiftRequest::GetWindows { space_id }),
+        },
         QueryCommands::Displays => Ok(RiftRequest::GetDisplays),
         QueryCommands::Window { window_id } => {
             let window_id = protocol_window_id(&parse_window_id(&window_id)?)?;
@@ -737,7 +761,8 @@ fn into_protocol_command(command: CliCommand) -> Result<rift_protocol::RiftComma
 fn decode_protocol<T, U>(value: T) -> Result<U, String>
 where
     T: Serialize,
-    U: DeserializeOwned, {
+    U: DeserializeOwned,
+{
     serde_json::from_value(serde_json::to_value(value).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())
 }
@@ -851,9 +876,11 @@ fn parse_event_kind(input: &str) -> Result<EventKind, String> {
         "window_title_changed" => Ok(EventKind::WindowTitleChanged),
         "focused_window_changed" => Ok(EventKind::FocusedWindowChanged),
         "stacks_changed" => Ok(EventKind::StacksChanged),
+        "layout_changed" => Ok(EventKind::LayoutChanged),
+        "selection_changed" => Ok(EventKind::SelectionChanged),
         "*" => Ok(EventKind::All),
         other => Err(format!(
-            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, or *",
+            "Invalid event '{}'; expected workspace_changed, windows_changed, window_title_changed, focused_window_changed, stacks_changed, layout_changed, selection_changed, or *",
             other
         )),
     }
@@ -863,11 +890,12 @@ fn parse_layout_mode(value: &str) -> Result<LayoutMode, String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "traditional" => Ok(LayoutMode::Traditional),
         "bsp" => Ok(LayoutMode::Bsp),
+        "floating" => Ok(LayoutMode::Floating),
         "stack" => Ok(LayoutMode::Stack),
         "master_stack" => Ok(LayoutMode::MasterStack),
         "scrolling" => Ok(LayoutMode::Scrolling),
         other => Err(format!(
-            "Invalid layout mode '{}'; must be traditional, bsp, stack, master_stack, or scrolling",
+            "Invalid layout mode '{}'; must be traditional, bsp, stack, master_stack, scrolling, or floating",
             other
         )),
     }
@@ -909,7 +937,11 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
                 scope_workspace_command(command, display_uuid),
             )))
         }
-        WorkspaceCommands::MoveAndFollow { workspace_id, display_uuid, window_id } => {
+        WorkspaceCommands::MoveAndFollow {
+            workspace_id,
+            display_uuid,
+            window_id,
+        } => {
             let command = LC::MoveWindowToWorkspace {
                 workspace: WorkspaceSelector::Index(workspace_id),
                 follow: true,
@@ -925,7 +957,11 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<CliCommand, String> {
         WorkspaceCommands::Last => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::SwitchToLastWorkspace,
         ))),
-        WorkspaceCommands::SetLayout { workspace_id, display_uuid, mode } => {
+        WorkspaceCommands::SetLayout {
+            workspace_id,
+            display_uuid,
+            mode,
+        } => {
             let mode = parse_layout_mode(&mode)?;
             let command = LC::SetWorkspaceLayout { workspace: workspace_id, mode };
             Ok(CliCommand::Reactor(reactor::Command::Layout(
@@ -1139,6 +1175,17 @@ fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
             reactor::ReactorCommand::MoveWindowToDisplay {
                 selector: build_display_selector(direction, index, uuid)?,
                 window_id,
+            },
+        ))),
+        DisplayCommands::MoveWorkspace {
+            direction,
+            index,
+            uuid,
+            wrap_around,
+        } => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                selector: build_display_selector(direction, index, uuid)?,
+                wrap_around,
             },
         ))),
     }

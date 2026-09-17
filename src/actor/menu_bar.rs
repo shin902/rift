@@ -152,13 +152,7 @@ impl Menu {
     fn apply_update(&mut self, update: &Update) {
         let Some(icon) = &mut self.icon else { return };
 
-        let sig = sig(
-            update.active_space.get() as u64,
-            update.active_space_is_activated,
-            update.active_workspace_idx,
-            &update.workspaces,
-            &update.windows,
-        );
+        let sig = sig(update.active_space_is_activated, &update.workspaces);
         if self.last_signature == Some(sig) {
             return;
         }
@@ -244,7 +238,7 @@ impl Menu {
                 Self::open_path_or_url("https://github.com/acsandmann/rift");
             }
             MenuAction::OpenDocumentation => {
-                Self::open_path_or_url("https://github.com/acsandmann/rift#readme");
+                Self::open_path_or_url("https://acsandmann.github.io/rift-docs/");
             }
             MenuAction::OpenMatrix => {
                 Self::open_path_or_url("https://matrix.to/#/#rift:matrix.org");
@@ -278,18 +272,12 @@ impl Menu {
     }
 
     fn reload_config(&self) {
-        let (response, _fut) = r#continue::continuation();
+        let (response, _result) = std::sync::mpsc::sync_channel(1);
         let msg = config::Event::ApplyConfig {
             cmd: ConfigCommand::ReloadConfig,
             response,
         };
-        if let Err(e) = self.config_tx.try_send(msg) {
-            let tokio::sync::mpsc::error::SendError((_span, msg)) = e;
-            match msg {
-                config::Event::ApplyConfig { response, .. } => std::mem::forget(response),
-                config::Event::QueryConfig(response) => std::mem::forget(response),
-            }
-        }
+        self.config_tx.send(msg);
     }
 
     fn spawn_debouncer(
@@ -326,39 +314,16 @@ impl Menu {
 
 // this is kind of reinventing the wheel but oh well i am using my brain
 #[inline(always)]
-fn sig(
-    active_space: u64,
-    active_space_is_activated: bool,
-    active_workspace: Option<u64>,
-    workspaces: &[RuntimeWorkspaceData],
-    windows: &[RuntimeWindowData],
-) -> u64 {
-    let mut x = active_space
-        ^ (windows.len() as u64).rotate_left(7)
-        ^ (workspaces.len() as u64).rotate_left(13);
+fn sig(active_space_is_activated: bool, workspaces: &[RuntimeWorkspaceData]) -> u64 {
+    let mut x = (workspaces.len() as u64).rotate_left(13);
     if active_space_is_activated {
         x ^= 0x9E37_79B9_7F4A_7C15u64;
     }
-    let mut s = active_space
-        .wrapping_add(windows.len() as u64)
-        .wrapping_add((workspaces.len() as u64).rotate_left(5));
-
-    if let Some(ws) = active_workspace {
-        let ws_tag = ws ^ 0xA5A5_A5A5_A5A5_A5A5u64;
-        x ^= ws_tag;
-        s = s.wrapping_add(ws_tag);
-    }
+    let mut s = (workspaces.len() as u64).rotate_left(5);
 
     for ws in workspaces {
         let v = workspace_sig(ws);
         x ^= v.rotate_left(9);
-        s = s.wrapping_add(v);
-    }
-
-    for w in windows {
-        let v = window_sig(w);
-
-        x ^= v;
         s = s.wrapping_add(v);
     }
 
@@ -425,8 +390,8 @@ mod tests {
         let base = vec![workspace("bsp")];
         let changed = vec![workspace("master_stack")];
 
-        let before = sig(1, true, Some(0), &base, &[]);
-        let after = sig(1, true, Some(0), &changed, &[]);
+        let before = sig(true, &base);
+        let after = sig(true, &changed);
 
         assert_ne!(before, after);
     }

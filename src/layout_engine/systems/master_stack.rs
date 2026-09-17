@@ -7,7 +7,7 @@ use crate::common::collections::HashMap;
 use crate::common::config::{
     MasterStackNewWindowPlacement, MasterStackSettings, MasterStackSide, WindowInsertionPoint,
 };
-use crate::layout_engine::systems::WindowLayoutConstraints;
+use crate::layout_engine::systems::{WindowLayoutConstraints, reconcile_app_membership};
 use crate::layout_engine::utils::compute_tiling_area;
 use crate::layout_engine::{
     Direction, LayoutId, LayoutKind, LayoutSystem, Orientation, ResizeOrientation,
@@ -89,16 +89,9 @@ impl MasterStackLayoutSystem {
         )
     }
 
-    fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
-        let root = self.inner.root(layout);
-        root.traverse_preorder(self.inner.map())
-            .filter_map(|node| self.inner.window_at(node))
-            .collect()
-    }
-
     fn windows_in_layout_by_container(&self, layout: LayoutId) -> Vec<WindowId> {
         self.windows_in_layout_by_container_with_order(layout, self.master_first())
-            .unwrap_or_else(|| self.all_windows_in_layout(layout))
+            .unwrap_or_else(|| self.inner.all_windows_in_layout(layout))
     }
 
     fn windows_in_layout_by_container_with_order(
@@ -136,6 +129,14 @@ impl MasterStackLayoutSystem {
             .all(|child| self.inner.window_at(child).is_some())
     }
 
+    fn has_valid_structure(&self, layout: LayoutId) -> bool {
+        let root = self.inner.root(layout);
+        let children: Vec<_> = root.children(self.inner.map()).collect();
+        children.len() == 2
+            && children.iter().all(|&child| self.inner.window_at(child).is_none())
+            && children.iter().all(|&child| self.container_is_flat(child))
+    }
+
     fn focused_container(&self, layout: LayoutId, master: NodeId, stack: NodeId) -> Option<NodeId> {
         let wid = self.inner.selected_window(layout)?;
         let node = self.inner.tree.data.window.node_for(layout, wid)?;
@@ -146,6 +147,25 @@ impl MasterStackLayoutSystem {
             Some(stack)
         } else {
             None
+        }
+    }
+
+    fn target_container_for_new_window(
+        &self,
+        layout: LayoutId,
+        master: NodeId,
+        stack: NodeId,
+    ) -> NodeId {
+        if self.windows_in_container(master).len() < self.settings.master_count {
+            return master;
+        }
+
+        match self.settings.new_window_placement {
+            MasterStackNewWindowPlacement::Master => master,
+            MasterStackNewWindowPlacement::Stack => stack,
+            MasterStackNewWindowPlacement::Focused => {
+                self.focused_container(layout, master, stack).unwrap_or(master)
+            }
         }
     }
 
@@ -183,11 +203,7 @@ impl MasterStackLayoutSystem {
 
     fn ensure_structure(&mut self, layout: LayoutId) -> (NodeId, NodeId, NodeId) {
         let root = self.inner.root(layout);
-        let children: Vec<_> = root.children(self.inner.map()).collect();
-        let valid = children.len() == 2
-            && children.iter().all(|&c| self.inner.window_at(c).is_none())
-            && children.iter().all(|&c| self.container_is_flat(c));
-        if !valid {
+        if !self.has_valid_structure(layout) {
             self.rebuild_layout(layout);
         }
         let children: Vec<_> = root.children(self.inner.map()).collect();
@@ -242,6 +258,16 @@ impl MasterStackLayoutSystem {
     }
 
     fn enforce_master_count(&mut self, layout: LayoutId, master: NodeId, stack: NodeId) {
+        self.enforce_master_count_preserving(layout, master, stack, None);
+    }
+
+    fn enforce_master_count_preserving(
+        &mut self,
+        layout: LayoutId,
+        master: NodeId,
+        stack: NodeId,
+        keep_in_master: Option<WindowId>,
+    ) {
         let mut master_windows = self.windows_in_container(master);
         let mut stack_windows = self.windows_in_container(stack);
         let selected = self.inner.selected_window(layout);
@@ -274,21 +300,26 @@ impl MasterStackLayoutSystem {
             }
         }
 
-        if master_windows.len() > desired {
-            let overflow = master_windows.split_off(desired);
-            for wid in overflow.into_iter().rev() {
-                let node = if is_master_first {
-                    self.move_window_to_container_front(layout, wid, stack)
-                } else {
-                    self.move_window_to_container(layout, wid, stack)
-                };
-                if let Some(node) = node {
-                    if Some(wid) == selected {
-                        self.inner.select(node);
-                    }
+        let keep_in_master = keep_in_master.filter(|_| desired > 0);
+        while master_windows.len() > desired {
+            let overflow_idx = master_windows
+                .iter()
+                .rposition(|wid| Some(*wid) != keep_in_master)
+                .expect("master overflow must contain a movable window");
+            let wid = master_windows.remove(overflow_idx);
+            let node = if is_master_first {
+                self.move_window_to_container_front(layout, wid, stack)
+            } else {
+                self.move_window_to_container(layout, wid, stack)
+            };
+            if let Some(node) = node {
+                if Some(wid) == selected {
+                    self.inner.select(node);
                 }
             }
-        } else if master_windows.len() < desired {
+        }
+
+        if master_windows.len() < desired {
             let needed = desired - master_windows.len();
             let to_move: Vec<_> = if is_master_first {
                 stack_windows.drain(..needed.min(stack_windows.len())).collect()
@@ -341,15 +372,13 @@ impl MasterStackLayoutSystem {
         Some(node.detach(&mut self.inner.tree).push_back(parent).finish())
     }
 
-    fn add_window_to_container(
+    fn insert_window_in_container(
         &mut self,
         layout: LayoutId,
         container: NodeId,
         wid: WindowId,
-    ) -> Option<NodeId> {
-        if !self.inner.map().contains(container) {
-            return None;
-        }
+    ) -> NodeId {
+        debug_assert!(self.inner.map().contains(container));
         let first_child = container.children(self.inner.map()).next();
         let node = match self.settings.base.window_insertion_point {
             Some(WindowInsertionPoint::NextToSelection) => {
@@ -369,7 +398,32 @@ impl MasterStackLayoutSystem {
             },
         };
         self.inner.tree.data.window.set_window(layout, node, wid);
-        Some(node)
+        node
+    }
+
+    fn rebalance_after_new_window(
+        &mut self,
+        layout: LayoutId,
+        master: NodeId,
+        stack: NodeId,
+        target: NodeId,
+        wid: WindowId,
+    ) {
+        match self.settings.base.window_insertion_point {
+            Some(WindowInsertionPoint::NextToSelection) => {
+                let keep_in_master = (target == master).then_some(wid);
+                self.enforce_master_count_preserving(layout, master, stack, keep_in_master);
+            }
+            Some(WindowInsertionPoint::EndOfTree) => {
+                // EndOfTree is layout-wide, so normalize the areas first and then
+                // put the new window at the end of whichever area it landed in.
+                self.enforce_master_count(layout, master, stack);
+                if let Some(node) = self.move_window_to_end_of_current_container(layout, wid) {
+                    self.inner.select(node);
+                }
+            }
+            None => self.enforce_master_count(layout, master, stack),
+        }
     }
 
     fn move_window_to_container_front(
@@ -399,6 +453,14 @@ impl MasterStackLayoutSystem {
     fn normalize_layout(&mut self, layout: LayoutId) {
         let (_root, master, stack) = self.ensure_structure(layout);
         self.enforce_master_count(layout, master, stack);
+    }
+
+    fn normalize_layout_preserving_order(&mut self, layout: LayoutId, windows: &[WindowId]) {
+        if self.has_valid_structure(layout) {
+            self.normalize_layout(layout);
+        } else {
+            self.rebuild_layout_with_windows(layout, windows);
+        }
     }
 
     pub fn adjust_master_ratio(&mut self, _layout: LayoutId, delta: f64) {
@@ -508,6 +570,8 @@ impl MasterStackLayoutSystem {
 }
 
 impl LayoutSystem for MasterStackLayoutSystem {
+    delegate_traditional_layout_system!();
+
     fn create_layout(&mut self) -> LayoutId {
         let layout = self.inner.create_layout();
         let root = self.inner.root(layout);
@@ -516,16 +580,12 @@ impl LayoutSystem for MasterStackLayoutSystem {
         layout
     }
 
-    fn contains_layout(&self, layout: LayoutId) -> bool { self.inner.contains_layout(layout) }
-
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
         let cloned = self.inner.clone_layout(layout);
         let (_root, master, stack) = self.ensure_structure(cloned);
         self.enforce_master_count(cloned, master, stack);
         cloned
     }
-
-    fn remove_layout(&mut self, layout: LayoutId) { self.inner.remove_layout(layout); }
 
     fn draw_tree(&self, layout: LayoutId) -> String {
         let root = self.inner.root(layout);
@@ -609,76 +669,29 @@ impl LayoutSystem for MasterStackLayoutSystem {
         )
     }
 
-    fn selected_window(&self, layout: LayoutId) -> Option<WindowId> {
-        self.inner.selected_window(layout)
-    }
-
     fn all_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
-        MasterStackLayoutSystem::all_windows_in_layout(self, layout)
-    }
-
-    fn visible_windows_in_layout(&self, layout: LayoutId) -> Vec<WindowId> {
-        self.inner.visible_windows_in_layout(layout)
-    }
-
-    fn visible_windows_under_selection(&self, layout: LayoutId) -> Vec<WindowId> {
-        self.inner.visible_windows_under_selection(layout)
-    }
-
-    fn ascend_selection(&mut self, layout: LayoutId) -> bool { self.inner.ascend_selection(layout) }
-
-    fn descend_selection(&mut self, layout: LayoutId) -> bool {
-        self.inner.descend_selection(layout)
-    }
-
-    fn move_focus(
-        &mut self,
-        layout: LayoutId,
-        direction: Direction,
-    ) -> (Option<WindowId>, Vec<WindowId>) {
-        self.inner.move_focus(layout, direction)
-    }
-
-    fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId> {
-        self.inner.window_in_direction(layout, direction)
+        self.inner.all_windows_in_layout(layout)
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
         let (_root, master, stack) = self.ensure_structure(layout);
-        let master_windows = self.windows_in_container(master);
-        let master_has_capacity = master_windows.len() < self.settings.master_count;
-        let target = if master_has_capacity {
-            master
-        } else {
-            match self.settings.new_window_placement {
-                MasterStackNewWindowPlacement::Master => master,
-                MasterStackNewWindowPlacement::Stack => stack,
-                MasterStackNewWindowPlacement::Focused => {
-                    self.focused_container(layout, master, stack).unwrap_or(master)
-                }
-            }
-        };
-        let node = self
-            .add_window_to_container(layout, target, wid)
-            .unwrap_or_else(|| self.inner.add_window_under(layout, target, wid));
+        let target = self.target_container_for_new_window(layout, master, stack);
+        let node = self.insert_window_in_container(layout, target, wid);
         self.inner.select(node);
-        self.enforce_master_count(layout, master, stack);
-        if self.settings.base.window_insertion_point == Some(WindowInsertionPoint::EndOfTree)
-            && let Some(node) = self.move_window_to_end_of_current_container(layout, wid)
-        {
-            self.inner.select(node);
-        }
-    }
-
-    fn replace_window(&mut self, from: WindowId, to: WindowId) {
-        self.inner.replace_window(from, to);
+        self.rebalance_after_new_window(layout, master, stack, target, wid);
     }
 
     fn remove_window(&mut self, wid: WindowId) {
-        let layouts = self.inner.layouts_for_window(wid);
+        let layouts: Vec<_> = self
+            .inner
+            .layouts_for_window(wid)
+            .into_iter()
+            .map(|layout| (layout, self.windows_in_layout_by_container(layout)))
+            .collect();
         self.inner.remove_window(wid);
-        for layout in layouts {
-            self.normalize_layout(layout);
+        for (layout, mut windows) in layouts {
+            windows.retain(|&window| window != wid);
+            self.normalize_layout_preserving_order(layout, &windows);
         }
     }
 
@@ -695,77 +708,26 @@ impl LayoutSystem for MasterStackLayoutSystem {
         }
     }
 
-    fn windows_for_app(&self, layout: LayoutId, pid: pid_t) -> Vec<WindowId> {
-        self.inner.windows_for_app(layout, pid)
-    }
-
-    fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, mut desired: Vec<WindowId>) {
+    fn set_windows_for_app(&mut self, layout: LayoutId, pid: pid_t, desired: Vec<WindowId>) {
         let (_root, master, stack) = self.ensure_structure(layout);
         let root = self.inner.root(layout);
-        let mut current = root
+        let current = root
             .traverse_postorder(self.inner.map())
-            .filter_map(|node| self.inner.window_at(node).map(|wid| (wid, node)))
-            .filter(|(wid, _)| wid.pid == pid)
+            .filter_map(|node| self.inner.window_at(node))
+            .filter(|wid| wid.pid == pid)
             .collect::<Vec<_>>();
-        desired.sort_unstable();
-        current.sort_unstable();
-        debug_assert!(desired.iter().all(|wid| wid.pid == pid));
-        let mut desired = desired.into_iter().peekable();
-        let mut current = current.into_iter().peekable();
-        loop {
-            match (desired.peek(), current.peek()) {
-                (Some(des), Some((cur, _))) if des == cur => {
-                    desired.next();
-                    current.next();
-                }
-                (Some(des), None) => {
-                    self.add_window_after_selection(layout, *des);
-                    desired.next();
-                }
-                (Some(des), Some((cur, _))) if des < cur => {
-                    self.add_window_after_selection(layout, *des);
-                    desired.next();
-                }
-                (_, Some((_, node))) => {
-                    if self.inner.tree.data.layout.info[*node].is_fullscreen {
-                        current.next();
-                    } else {
-                        node.detach(&mut self.inner.tree).remove();
-                        current.next();
-                    }
-                }
-                (None, None) => break,
+        let delta = reconcile_app_membership(pid, current, desired);
+        for wid in delta.removals {
+            if let Some(node) = self.inner.tree.data.window.node_for(layout, wid)
+                && !self.inner.tree.data.layout.info[node].is_fullscreen
+            {
+                node.detach(&mut self.inner.tree).remove();
             }
         }
+        for wid in delta.additions {
+            self.add_window_after_selection(layout, wid);
+        }
         self.enforce_master_count(layout, master, stack);
-    }
-
-    fn has_windows_for_app(&self, layout: LayoutId, pid: pid_t) -> bool {
-        self.inner.has_windows_for_app(layout, pid)
-    }
-
-    fn contains_window(&self, layout: LayoutId, wid: WindowId) -> bool {
-        self.inner.contains_window(layout, wid)
-    }
-
-    fn select_window(&mut self, layout: LayoutId, wid: WindowId) -> bool {
-        self.inner.select_window(layout, wid)
-    }
-
-    fn on_window_resized(
-        &mut self,
-        layout: LayoutId,
-        wid: WindowId,
-        old_frame: CGRect,
-        new_frame: CGRect,
-        screen: CGRect,
-        gaps: &crate::common::config::GapSettings,
-    ) {
-        self.inner.on_window_resized(layout, wid, old_frame, new_frame, screen, gaps);
-    }
-
-    fn swap_windows(&mut self, layout: LayoutId, a: WindowId, b: WindowId) -> bool {
-        self.inner.swap_windows(layout, a, b)
     }
 
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool {
@@ -905,18 +867,6 @@ impl LayoutSystem for MasterStackLayoutSystem {
         self.normalize_layout(layout);
     }
 
-    fn toggle_fullscreen_of_selection(&mut self, layout: LayoutId) -> Vec<WindowId> {
-        self.inner.toggle_fullscreen_of_selection(layout)
-    }
-
-    fn toggle_fullscreen_within_gaps_of_selection(&mut self, layout: LayoutId) -> Vec<WindowId> {
-        self.inner.toggle_fullscreen_within_gaps_of_selection(layout)
-    }
-
-    fn has_any_fullscreen_node(&self, layout: LayoutId) -> bool {
-        self.inner.has_any_fullscreen_node(layout)
-    }
-
     fn join_selection_with_direction(&mut self, layout: LayoutId, direction: Direction) {
         let _ = direction;
         self.normalize_layout(layout);
@@ -966,6 +916,7 @@ impl LayoutSystem for MasterStackLayoutSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::config::{LayoutMode, LayoutSettings};
 
     fn w(idx: u32) -> WindowId { WindowId::new(1, idx) }
 
@@ -991,6 +942,83 @@ mod tests {
         // When w2 is added: master=[w2], stack=[w1]
         // When w3 is added: master=[w3], stack=[w2, w1] (since w2 was at index 0 and got pushed to stack, w1 was pushed next)
         assert_eq!(windows, vec![w(3), w(2), w(1)]);
+    }
+
+    #[test]
+    fn next_to_selection_keeps_new_window_in_full_master_area() {
+        let layout_settings: LayoutSettings = toml::from_str(
+            r#"
+                window_insertion_point = "next_to_selection"
+
+                [master_stack]
+                master_count = 1
+                new_window_placement = "master"
+            "#,
+        )
+        .unwrap();
+        let mut settings = layout_settings.master_stack.clone();
+        settings.base = layout_settings.resolved_base_for(LayoutMode::MasterStack);
+        let mut system = MasterStackLayoutSystem::new(settings);
+        let layout = system.create_layout();
+
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        let (_root, master, stack) = system.ensure_structure(layout);
+        assert_eq!(system.windows_in_container(master), vec![w(2)]);
+        assert_eq!(system.windows_in_container(stack), vec![w(1)]);
+    }
+
+    #[test]
+    fn next_to_selection_orders_within_the_selected_target_area() {
+        let mut settings = MasterStackSettings::default();
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::NextToSelection);
+        settings.master_count = 2;
+        let mut system = MasterStackLayoutSystem::new(settings);
+        let layout = system.create_layout();
+
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        assert!(system.select_window(layout, w(1)));
+        system.add_window_after_selection(layout, w(3));
+
+        let (_root, master, stack) = system.ensure_structure(layout);
+        assert_eq!(system.windows_in_container(master), vec![w(1), w(3)]);
+        assert_eq!(system.windows_in_container(stack), vec![w(2)]);
+    }
+
+    #[test]
+    fn next_to_selection_respects_stack_placement() {
+        let mut settings = MasterStackSettings::default();
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::NextToSelection);
+        settings.new_window_placement = MasterStackNewWindowPlacement::Stack;
+        let mut system = MasterStackLayoutSystem::new(settings);
+        let layout = system.create_layout();
+
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+
+        let (_root, master, stack) = system.ensure_structure(layout);
+        assert_eq!(system.windows_in_container(master), vec![w(1)]);
+        assert_eq!(system.windows_in_container(stack), vec![w(2)]);
+    }
+
+    #[test]
+    fn next_to_selection_respects_focused_placement() {
+        let mut settings = MasterStackSettings::default();
+        settings.base.window_insertion_point = Some(WindowInsertionPoint::NextToSelection);
+        settings.new_window_placement = MasterStackNewWindowPlacement::Focused;
+        let mut system = MasterStackLayoutSystem::new(settings);
+        let layout = system.create_layout();
+
+        system.add_window_after_selection(layout, w(1));
+        system.add_window_after_selection(layout, w(2));
+        assert!(system.select_window(layout, w(1)));
+        system.add_window_after_selection(layout, w(3));
+
+        let (_root, master, stack) = system.ensure_structure(layout);
+        assert_eq!(system.windows_in_container(master), vec![w(2)]);
+        assert_eq!(system.windows_in_container(stack), vec![w(1), w(3)]);
     }
 
     #[test]
@@ -1162,5 +1190,38 @@ mod tests {
         assert!(system.move_selection(layout, Direction::Right));
         let windows = system.windows_in_layout_by_container(layout);
         assert_eq!(windows, vec![w(3), w(4), w(1), w(2)]);
+    }
+
+    #[test]
+    fn removing_stack_window_preserves_master_membership_when_master_is_last() {
+        for master_side in [MasterStackSide::Right, MasterStackSide::Bottom] {
+            let mut settings = MasterStackSettings::default();
+            settings.master_count = 2;
+            settings.master_side = master_side;
+            settings.new_window_placement = MasterStackNewWindowPlacement::Stack;
+            let mut system = MasterStackLayoutSystem::new(settings);
+            let layout = system.create_layout();
+
+            system.add_window_after_selection(layout, w(1));
+            system.add_window_after_selection(layout, w(2));
+            system.add_window_after_selection(layout, w(3));
+            system.add_window_after_selection(layout, w(4));
+
+            let (_root, master, stack) = system.ensure_structure(layout);
+            let master_before = system.windows_in_container(master);
+            let stack_before = system.windows_in_container(stack);
+            assert_eq!(master_before.len(), 2);
+            assert_eq!(stack_before.len(), 2);
+            assert!(stack_before.contains(&w(3)));
+
+            system.remove_window(w(3));
+
+            let (_root, master, stack) = system.ensure_structure(layout);
+            assert_eq!(system.windows_in_container(master), master_before);
+            assert_eq!(
+                system.windows_in_container(stack),
+                stack_before.into_iter().filter(|&window| window != w(3)).collect::<Vec<_>>()
+            );
+        }
     }
 }

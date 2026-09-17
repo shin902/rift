@@ -7,10 +7,11 @@
 #![allow(non_snake_case)]
 #![allow(clippy::missing_safety_doc)]
 
-use core::mem::{size_of, zeroed};
-use core::ptr::{copy_nonoverlapping, null, null_mut};
+use core::mem::{MaybeUninit, size_of, zeroed};
+use core::ptr::{addr_of_mut, copy_nonoverlapping, null, null_mut};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::vec::Vec;
 
 use tracing::{debug, error, info};
@@ -28,7 +29,15 @@ fn bs_name() -> CString {
 
 pub fn is_mach_server_registered() -> bool {
     let bs_name = bs_name();
-    unsafe { mach_get_bs_port(&bs_name) != 0 }
+    unsafe {
+        let service_port = mach_get_bs_port(&bs_name);
+        if service_port == 0 {
+            return false;
+        }
+        // bootstrap_look_up gives this task a send-right reference.
+        let _ = mach_port_deallocate(mach_task_self(), service_port);
+        true
+    }
 }
 
 type kern_return_t = c_int;
@@ -61,6 +70,7 @@ const MACH_MSG_TYPE_MOVE_SEND_ONCE: u32 = 18;
 const MACH_MSG_TYPE_MAKE_SEND_ONCE: u32 = 21;
 const MACH_MSGH_BITS_COMPLEX: u32 = 0x8000_0000;
 const MACH_MSG_TYPE_MAKE_SEND: u32 = 20;
+const MACH_NOTIFY_DEAD_NAME: mach_msg_id_t = 72;
 
 const MACH_PORT_RIGHT_RECEIVE: c_int = 1;
 const MACH_PORT_RIGHT_SEND: c_int = 0;
@@ -126,7 +136,6 @@ unsafe extern "C" {
 
     fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
     fn CFRunLoopGetCurrent() -> CFRunLoopRef;
-    fn CFRunLoopGetMain() -> CFRunLoopRef;
     fn CFRunLoopRun();
 
     fn CFRelease(obj: *const c_void);
@@ -279,6 +288,16 @@ unsafe extern "C" {
 
     fn mach_port_deallocate(task: mach_port_name_t, name: mach_port_name_t) -> kern_return_t;
 
+    fn mach_port_request_notification(
+        task: mach_port_name_t,
+        name: mach_port_name_t,
+        id: mach_msg_id_t,
+        sync: u32,
+        notify: mach_port_t,
+        notify_type: c_int,
+        previous: *mut mach_port_t,
+    ) -> kern_return_t;
+
     fn mach_port_set_attributes(
         task: mach_port_name_t,
         name: mach_port_name_t,
@@ -338,6 +357,41 @@ unsafe extern "C" {
 const MAX_MESSAGE_SIZE_USIZE: usize = MAX_MESSAGE_SIZE as usize;
 type mach_message_t = mach_inline_message_t<MAX_MESSAGE_SIZE_USIZE>;
 type mach_buffer_t = mach_receive_buffer_t<MAX_MESSAGE_SIZE_USIZE>;
+
+/// Initializes only the bytes that `mach_msg` will read for an inline send.
+///
+/// The old send paths zeroed the entire 256 KiB maximum-sized payload buffer
+/// for every message, even though most IPC payloads are only a few hundred
+/// bytes. Keeping the fixed-size storage avoids a heap allocation while
+/// `MaybeUninit` avoids touching bytes outside the declared Mach message.
+unsafe fn prepare_inline_send(
+    storage: &mut MaybeUninit<mach_message_t>,
+    mut header: mach_msg_header_t,
+    payload: *const u8,
+    payload_len: u32,
+) -> *mut mach_msg_header_t {
+    debug_assert!(!payload.is_null());
+    debug_assert!(payload_len <= MAX_MESSAGE_SIZE);
+
+    let aligned_len = (payload_len + 3) & !3;
+    header.msgh_size = size_of::<mach_msg_header_t>() as u32 + aligned_len;
+
+    let message = storage.as_mut_ptr();
+    let header_ptr = addr_of_mut!((*message).header);
+    header_ptr.write(header);
+
+    let data = addr_of_mut!((*message).data).cast::<u8>();
+    copy_nonoverlapping(payload, data, payload_len as usize);
+    if aligned_len > payload_len {
+        core::ptr::write_bytes(
+            data.add(payload_len as usize),
+            0,
+            (aligned_len - payload_len) as usize,
+        );
+    }
+
+    header_ptr
+}
 
 static mut g_server_port: mach_port_t = MACH_PORT_NULL;
 static mut window_sub_level_error_logged: bool = false;
@@ -539,14 +593,7 @@ unsafe fn create_connection_server_port() -> mach_port_t {
     let bundle = b"com.acsandmann.rift";
     let copy_len = bundle.len().min(msg.0.bundle_name.len());
     msg.0.bundle_name[..copy_len].copy_from_slice(&bundle[..copy_len]);
-    if bundle.len() > copy_len {
-        debug!(
-            bundle_len = bundle.len(),
-            max_len = msg.0.bundle_name.len(),
-            "Truncating connection server bundle name"
-        );
-    }
-    msg.0.bundle_size = msg.0.bundle_name.len() as i32;
+    msg.0.bundle_size = copy_len as i32;
 
     let header_ptr = core::ptr::addr_of_mut!(msg.0.header);
     let local_port = core::ptr::read_unaligned(core::ptr::addr_of!(msg.0.header.msgh_local_port));
@@ -731,7 +778,103 @@ pub unsafe fn mach_release_send_right(port: mach_port_t) -> bool {
     if port == 0 {
         return false;
     }
-    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, -1) == KERN_SUCCESS
+    // Unlike `mach_port_mod_refs(..., MACH_PORT_RIGHT_SEND, -1)`, deallocate
+    // also releases the reference after a dead-name notification has changed
+    // the send right into a dead-name right.
+    mach_port_deallocate(mach_task_self(), port) == KERN_SUCCESS
+}
+
+/// Requests a single dead-name notification for a send right owned by this task.
+pub unsafe fn mach_watch_send_right(port: mach_port_t) -> bool {
+    let notify_port = IPC_SERVER_PORT.load(Ordering::Acquire);
+    if port == MACH_PORT_NULL || notify_port == MACH_PORT_NULL {
+        return false;
+    }
+
+    let mut previous = MACH_PORT_NULL;
+    let result = mach_port_request_notification(
+        mach_task_self(),
+        port,
+        MACH_NOTIFY_DEAD_NAME,
+        1,
+        notify_port,
+        MACH_MSG_TYPE_MAKE_SEND_ONCE as c_int,
+        &mut previous,
+    );
+    if previous != MACH_PORT_NULL {
+        let _ = mach_port_deallocate(mach_task_self(), previous);
+    }
+    result == KERN_SUCCESS
+}
+
+/// Cancels a pending dead-name notification, releasing its returned send-once right.
+pub unsafe fn mach_unwatch_send_right(port: mach_port_t) {
+    if port == MACH_PORT_NULL {
+        return;
+    }
+
+    let mut previous = MACH_PORT_NULL;
+    let _ = mach_port_request_notification(
+        mach_task_self(),
+        port,
+        MACH_NOTIFY_DEAD_NAME,
+        0,
+        MACH_PORT_NULL,
+        0,
+        &mut previous,
+    );
+    if previous != MACH_PORT_NULL {
+        let _ = mach_port_deallocate(mach_task_self(), previous);
+    }
+}
+
+/// A reply destination whose send right remains valid after a received Mach
+/// message is destroyed.
+///
+/// CFMachPort owns the received message and destroys it as soon as its callback
+/// returns. Retaining the send right lets a different thread reply later without
+/// keeping a pointer into that callback's stack or relying on the received
+/// message's lifetime.
+pub struct OwnedMachReply {
+    header: mach_msg_header_t,
+}
+
+impl OwnedMachReply {
+    /// Copies the received header and retains its remote send right.
+    ///
+    /// # Safety
+    ///
+    /// `original_msg` must point to a valid received Mach message header for
+    /// the duration of this call.
+    pub unsafe fn retain(original_msg: *const mach_msg_header_t) -> Option<Self> {
+        if original_msg.is_null() {
+            return None;
+        }
+
+        let header = core::ptr::read_unaligned(original_msg);
+        if !mach_retain_send_right(header.msgh_remote_port) {
+            error!(
+                "OwnedMachReply: failed to retain reply send right for port {}",
+                header.msgh_remote_port
+            );
+            return None;
+        }
+
+        Some(Self { header })
+    }
+
+    pub fn header_mut(&mut self) -> &mut mach_msg_header_t { &mut self.header }
+}
+
+impl Drop for OwnedMachReply {
+    fn drop(&mut self) {
+        if !unsafe { mach_release_send_right(self.header.msgh_remote_port) } {
+            error!(
+                "OwnedMachReply: failed to release reply send right for port {}",
+                self.header.msgh_remote_port
+            );
+        }
+    }
 }
 
 unsafe fn receive_message_on_port(
@@ -739,9 +882,13 @@ unsafe fn receive_message_on_port(
     response_buf: &mut Vec<u8>,
     log_ctx: &str,
 ) -> bool {
-    let mut buffer: mach_buffer_t = zeroed();
+    // `mach_msg` initializes the received header, payload, and trailer. Avoid
+    // clearing the full maximum-sized receive buffer before handing it over.
+    let mut buffer = MaybeUninit::<mach_buffer_t>::uninit();
+    let buffer_ptr = buffer.as_mut_ptr();
+    let header_ptr = addr_of_mut!((*buffer_ptr).message.header);
     let recv_result = mach_msg(
-        &mut buffer.message.header,
+        header_ptr,
         MACH_RCV_MSG,
         0,
         size_of::<mach_buffer_t>() as u32,
@@ -758,26 +905,17 @@ unsafe fn receive_message_on_port(
         return false;
     }
 
-    let mut rsp_ptr: *mut c_char = null_mut();
-    let mut rsp_len: usize = 0;
-
-    let inline_len = buffer
-        .message
-        .header
-        .msgh_size
-        .saturating_sub(size_of::<mach_msg_header_t>() as u32) as usize;
-    if inline_len > 0 {
-        rsp_len = inline_len;
-        rsp_ptr = buffer.message.data.as_mut_ptr() as *mut c_char;
-    }
+    let inline_len =
+        (*header_ptr).msgh_size.saturating_sub(size_of::<mach_msg_header_t>() as u32) as usize;
 
     response_buf.clear();
-    if rsp_len > 0 && !rsp_ptr.is_null() {
-        let slice = core::slice::from_raw_parts(rsp_ptr as *const u8, rsp_len);
+    if inline_len > 0 {
+        let rsp_ptr = addr_of_mut!((*buffer_ptr).message.data).cast::<u8>();
+        let slice = core::slice::from_raw_parts(rsp_ptr, inline_len);
         response_buf.extend_from_slice(slice);
     }
 
-    mach_msg_destroy(&mut buffer.message.header);
+    mach_msg_destroy(header_ptr);
     true
 }
 
@@ -830,33 +968,29 @@ pub unsafe fn mach_send_message(
         }
     }
 
-    let aligned_len = (len + 3) & !3;
-
-    let mut sm: mach_message_t = zeroed();
-    sm.header.msgh_remote_port = port;
-    sm.header.msgh_local_port = if await_response { reply_port } else { 0 };
-    sm.header.msgh_voucher_port = 0;
-    sm.header.msgh_id = if await_response { reply_port as i32 } else { 0 };
-    sm.header.msgh_bits = MACH_MSGH_BITS(
-        MACH_MSG_TYPE_COPY_SEND,
-        if await_response {
-            MACH_MSG_TYPE_MAKE_SEND
-        } else {
-            0
-        },
-    );
-    sm.header.msgh_size = (size_of::<mach_msg_header_t>() as u32) + aligned_len;
-
-    copy_nonoverlapping(message as *const u8, sm.data.as_mut_ptr(), len as usize);
-    if aligned_len > len {
-        let pad = (aligned_len - len) as usize;
-        core::ptr::write_bytes(sm.data.as_mut_ptr().add(len as usize), 0, pad);
-    }
+    let header = mach_msg_header_t {
+        msgh_bits: MACH_MSGH_BITS(
+            MACH_MSG_TYPE_COPY_SEND,
+            if await_response {
+                MACH_MSG_TYPE_MAKE_SEND
+            } else {
+                0
+            },
+        ),
+        msgh_size: 0,
+        msgh_remote_port: port,
+        msgh_local_port: if await_response { reply_port } else { 0 },
+        msgh_voucher_port: 0,
+        msgh_id: if await_response { reply_port as i32 } else { 0 },
+    };
+    let mut storage = MaybeUninit::<mach_message_t>::uninit();
+    let header_ptr = prepare_inline_send(&mut storage, header, message.cast(), len);
+    let send_size = (*header_ptr).msgh_size;
 
     let send_result = mach_msg(
-        &mut sm.header,
+        header_ptr,
         MACH_SEND_MSG,
-        sm.header.msgh_size,
+        send_size,
         0,
         0,
         MACH_MSG_TIMEOUT_NONE,
@@ -901,26 +1035,22 @@ pub unsafe fn mach_try_send_message(port: mach_port_t, message: *const c_char, l
         return false;
     }
 
-    let aligned_len = (len + 3) & !3;
-
-    let mut sm: mach_message_t = zeroed();
-    sm.header.msgh_remote_port = port;
-    sm.header.msgh_local_port = 0;
-    sm.header.msgh_voucher_port = 0;
-    sm.header.msgh_id = 0;
-    sm.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-    sm.header.msgh_size = (size_of::<mach_msg_header_t>() as u32) + aligned_len;
-
-    copy_nonoverlapping(message as *const u8, sm.data.as_mut_ptr(), len as usize);
-    if aligned_len > len {
-        let pad = (aligned_len - len) as usize;
-        core::ptr::write_bytes(sm.data.as_mut_ptr().add(len as usize), 0, pad);
-    }
+    let header = mach_msg_header_t {
+        msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0),
+        msgh_size: 0,
+        msgh_remote_port: port,
+        msgh_local_port: 0,
+        msgh_voucher_port: 0,
+        msgh_id: 0,
+    };
+    let mut storage = MaybeUninit::<mach_message_t>::uninit();
+    let header_ptr = prepare_inline_send(&mut storage, header, message.cast(), len);
+    let send_size = (*header_ptr).msgh_size;
 
     let send_result = mach_msg(
-        &mut sm.header,
+        header_ptr,
         MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-        sm.header.msgh_size,
+        send_size,
         0,
         0,
         0,
@@ -953,26 +1083,22 @@ pub unsafe fn mach_send_message_with_reply_port(
         return false;
     }
 
-    let aligned_len = (len + 3) & !3;
-
-    let mut sm: mach_message_t = zeroed();
-    sm.header.msgh_remote_port = port;
-    sm.header.msgh_local_port = reply_port;
-    sm.header.msgh_voucher_port = 0;
-    sm.header.msgh_id = reply_port as i32;
-    sm.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND);
-    sm.header.msgh_size = (size_of::<mach_msg_header_t>() as u32) + aligned_len;
-
-    copy_nonoverlapping(message as *const u8, sm.data.as_mut_ptr(), len as usize);
-    if aligned_len > len {
-        let pad = (aligned_len - len) as usize;
-        core::ptr::write_bytes(sm.data.as_mut_ptr().add(len as usize), 0, pad);
-    }
+    let header = mach_msg_header_t {
+        msgh_bits: MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_COPY_SEND),
+        msgh_size: 0,
+        msgh_remote_port: port,
+        msgh_local_port: reply_port,
+        msgh_voucher_port: 0,
+        msgh_id: reply_port as i32,
+    };
+    let mut storage = MaybeUninit::<mach_message_t>::uninit();
+    let header_ptr = prepare_inline_send(&mut storage, header, message.cast(), len);
+    let send_size = (*header_ptr).msgh_size;
 
     let send_result = mach_msg(
-        &mut sm.header,
+        header_ptr,
         MACH_SEND_MSG,
-        sm.header.msgh_size,
+        send_size,
         0,
         0,
         MACH_MSG_TIMEOUT_NONE,
@@ -1087,6 +1213,12 @@ pub type mach_handler = unsafe extern "C" fn(
     original_msg: *mut mach_msg_header_t,
 );
 
+pub type mach_dead_name_handler = unsafe extern "C" fn(context: *mut c_void, port: mach_port_t);
+
+unsafe extern "C" fn ignore_dead_name(_context: *mut c_void, _port: mach_port_t) {}
+
+static IPC_SERVER_PORT: AtomicU32 = AtomicU32::new(MACH_PORT_NULL);
+
 #[repr(C)]
 pub struct mach_server {
     is_running: bool,
@@ -1094,6 +1226,7 @@ pub struct mach_server {
     port: mach_port_t,
     bs_port: mach_port_t,
     handler: Option<mach_handler>,
+    dead_name_handler: Option<mach_dead_name_handler>,
     context: *mut c_void,
 }
 
@@ -1105,6 +1238,7 @@ impl Default for mach_server {
             port: 0,
             bs_port: 0,
             handler: None,
+            dead_name_handler: None,
             context: null_mut(),
         }
     }
@@ -1122,6 +1256,25 @@ extern "C" fn mach_message_callback(
         }
         let mach_server = &mut *(context as *mut mach_server);
         let header_val = core::ptr::read_unaligned(message as *const mach_msg_header_t);
+
+        if header_val.msgh_id == MACH_NOTIFY_DEAD_NAME {
+            #[repr(C)]
+            struct DeadNameNotification {
+                header: mach_msg_header_t,
+                ndr: ndr_record_t,
+                port: mach_port_name_t,
+            }
+
+            if header_val.msgh_size as usize >= size_of::<DeadNameNotification>() {
+                let notification =
+                    core::ptr::read_unaligned(message as *const DeadNameNotification);
+                if let Some(handler) = mach_server.dead_name_handler {
+                    handler(mach_server.context, notification.port);
+                }
+            }
+            let _ = mach_msg_destroy(message as *mut mach_msg_header_t);
+            return;
+        }
         let header_ptr = &header_val as *const mach_msg_header_t as *mut mach_msg_header_t;
         if header_val.msgh_remote_port == 0 {
             return;
@@ -1165,6 +1318,7 @@ pub unsafe fn mach_server_begin(
     mach_server: &mut mach_server,
     context: *mut c_void,
     handler: mach_handler,
+    dead_name_handler: mach_dead_name_handler,
 ) -> bool {
     mach_server.task = mach_task_self();
 
@@ -1229,8 +1383,10 @@ pub unsafe fn mach_server_begin(
     );
 
     mach_server.handler = Some(handler);
+    mach_server.dead_name_handler = Some(dead_name_handler);
     mach_server.context = context;
     mach_server.is_running = true;
+    IPC_SERVER_PORT.store(mach_server.port, Ordering::Release);
 
     let cf_context = CFMachPortContext {
         version: 0,
@@ -1259,7 +1415,7 @@ pub unsafe fn mach_server_begin(
         CFRelease(cf_mach_port);
         return false;
     }
-    CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopDefaultMode);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopDefaultMode);
     CFRelease(source);
     CFRelease(cf_mach_port);
 
@@ -1286,73 +1442,57 @@ pub unsafe fn send_mach_reply(
         return false;
     }
 
-    let task = mach_task_self();
-    let mut remote_port_type: u32 = 0;
-    let mut local_port_type: u32 = 0;
-
-    if (*original_msg).msgh_remote_port != 0 {
-        let _ = mach_port_type(task, (*original_msg).msgh_remote_port, &mut remote_port_type);
-    }
-    if (*original_msg).msgh_local_port != 0 {
-        let _ = mach_port_type(task, (*original_msg).msgh_local_port, &mut local_port_type);
-    }
-
     let reply_port = (*original_msg).msgh_remote_port;
     let reply_descriptor = MACH_MSG_TYPE_COPY_SEND;
     if reply_port == 0 {
         error!(
-            "send_mach_reply: no available send right (remote_port_type={} local_port_type={} remote_port={} local_port={})",
-            remote_port_type,
-            local_port_type,
+            "send_mach_reply: no available send right (remote_port={} local_port={})",
             (*original_msg).msgh_remote_port,
             (*original_msg).msgh_local_port
         );
         return false;
     };
 
-    let mut reply: mach_message_t = zeroed();
-
-    let aligned_len = (response_len + 3) & !3;
-    let total_size = (size_of::<mach_msg_header_t>() as u32) + aligned_len;
-
-    reply.header.msgh_bits = MACH_MSGH_BITS(reply_descriptor as u32, 0);
-    reply.header.msgh_size = total_size;
-    reply.header.msgh_remote_port = reply_port;
-    reply.header.msgh_local_port = 0;
-    reply.header.msgh_voucher_port = 0;
-    reply.header.msgh_id = (*original_msg).msgh_id;
-
-    copy_nonoverlapping(
-        response_data as *const u8,
-        reply.data.as_mut_ptr() as *mut u8,
-        response_len as usize,
-    );
-    if aligned_len > response_len {
-        let pad = (aligned_len - response_len) as usize;
-        let dst = reply.data.as_mut_ptr().add(response_len as usize);
-        core::ptr::write_bytes(dst, 0, pad);
-    }
+    let header = mach_msg_header_t {
+        msgh_bits: MACH_MSGH_BITS(reply_descriptor as u32, 0),
+        msgh_size: 0,
+        msgh_remote_port: reply_port,
+        msgh_local_port: 0,
+        msgh_voucher_port: 0,
+        msgh_id: (*original_msg).msgh_id,
+    };
+    let mut storage = MaybeUninit::<mach_message_t>::uninit();
+    let header_ptr = prepare_inline_send(&mut storage, header, response_data.cast(), response_len);
+    let send_size = (*header_ptr).msgh_size;
 
     let result = mach_msg(
-        &mut reply.header,
-        MACH_SEND_MSG,
-        reply.header.msgh_size,
+        header_ptr,
+        // Never let an abandoned/full client reply port block the Mach server
+        // or an asynchronous reply worker indefinitely.
+        MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+        send_size,
         0,
         0,
-        MACH_MSG_TIMEOUT_NONE,
+        0,
         0,
     );
 
     if result != MACH_MSG_SUCCESS {
-        let mut _port_type: u32 = 0;
-        let _ = mach_port_type(task, reply_port, &mut _port_type);
+        // Port inspection is diagnostic-only and relatively expensive. Keep
+        // it off the successful reply path.
+        let task = mach_task_self();
+        let mut reply_port_type: u32 = 0;
+        let mut local_port_type: u32 = 0;
+        let _ = mach_port_type(task, reply_port, &mut reply_port_type);
+        if (*original_msg).msgh_local_port != 0 {
+            let _ = mach_port_type(task, (*original_msg).msgh_local_port, &mut local_port_type);
+        }
         error!(
-            "send_mach_reply: mach_msg failed result={} reply_port={} port_type={} descriptor={} remote_port_type={} local_port_type={} original_remote={} original_local={}",
+            "send_mach_reply: mach_msg failed result={} reply_port={} port_type={} descriptor={} local_port_type={} original_remote={} original_local={}",
             result,
             reply_port,
-            _port_type,
+            reply_port_type,
             reply_descriptor,
-            remote_port_type,
             local_port_type,
             MACH_MSGH_BITS_REMOTE((*original_msg).msgh_bits),
             MACH_MSGH_BITS_LOCAL((*original_msg).msgh_bits)
@@ -1364,6 +1504,32 @@ pub unsafe fn send_mach_reply(
 }
 
 #[allow(static_mut_refs)]
+/// Installs the Mach receive source on the current thread's CFRunLoop without
+/// starting or blocking that run loop. The caller must keep `context` valid for
+/// as long as the server can receive messages.
+pub unsafe fn mach_server_install(
+    context: *mut c_void,
+    handler: mach_handler,
+    dead_name_handler: mach_dead_name_handler,
+) -> bool {
+    static mut SERVER: mach_server = mach_server {
+        is_running: false,
+        task: 0,
+        port: 0,
+        bs_port: 0,
+        handler: None,
+        dead_name_handler: None,
+        context: null_mut(),
+    };
+
+    if SERVER.is_running {
+        error!("mach_server_install: server is already running");
+        return false;
+    }
+    mach_server_begin(&mut SERVER, context, handler, dead_name_handler)
+}
+
+#[allow(static_mut_refs)]
 pub unsafe fn mach_server_run(context: *mut c_void, handler: mach_handler) -> bool {
     static mut SERVER: mach_server = mach_server {
         is_running: false,
@@ -1371,6 +1537,7 @@ pub unsafe fn mach_server_run(context: *mut c_void, handler: mach_handler) -> bo
         port: 0,
         bs_port: 0,
         handler: None,
+        dead_name_handler: None,
         context: null_mut(),
     };
 
@@ -1383,7 +1550,7 @@ pub unsafe fn mach_server_run(context: *mut c_void, handler: mach_handler) -> bo
         SERVER.context
     );
 
-    if !mach_server_begin(&mut SERVER, context, handler) {
+    if !mach_server_begin(&mut SERVER, context, handler, ignore_dead_name) {
         error!("mach_server_run: mach_server_begin failed, aborting run loop");
         return false;
     }
@@ -1394,4 +1561,75 @@ pub unsafe fn mach_server_run(context: *mut c_void, handler: mach_handler) -> bo
     );
     CFRunLoopRun();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_send_initializes_only_the_declared_message() {
+        let payload = b"hello";
+        let header = mach_msg_header_t {
+            msgh_bits: 7,
+            msgh_size: 0,
+            msgh_remote_port: 11,
+            msgh_local_port: 13,
+            msgh_voucher_port: 0,
+            msgh_id: 17,
+        };
+        let mut storage = MaybeUninit::<mach_message_t>::uninit();
+        let header_ptr = unsafe {
+            prepare_inline_send(&mut storage, header, payload.as_ptr(), payload.len() as u32)
+        };
+
+        unsafe {
+            assert_eq!((*header_ptr).msgh_bits, 7);
+            assert_eq!((*header_ptr).msgh_remote_port, 11);
+            assert_eq!((*header_ptr).msgh_local_port, 13);
+            assert_eq!((*header_ptr).msgh_id, 17);
+            assert_eq!(
+                (*header_ptr).msgh_size as usize,
+                size_of::<mach_msg_header_t>() + 8
+            );
+
+            let data = addr_of_mut!((*storage.as_mut_ptr()).data).cast::<u8>();
+            assert_eq!(core::slice::from_raw_parts(data, 8), b"hello\0\0\0");
+        }
+    }
+
+    #[test]
+    fn owned_mach_reply_survives_received_message_cleanup() {
+        unsafe {
+            let reply_port = mach_allocate_reply_port().expect("allocate reply port");
+            let mut received_header = zeroed::<mach_msg_header_t>();
+            received_header.msgh_remote_port = reply_port;
+            received_header.msgh_id = 42;
+
+            let mut destination =
+                OwnedMachReply::retain(&received_header).expect("retain reply destination");
+
+            // Simulate mach_msg_destroy consuming the send right carried by
+            // the received message after the CFMachPort callback returns.
+            assert!(mach_release_send_right(reply_port));
+
+            let response = b"reply\0";
+            assert!(send_mach_reply(
+                destination.header_mut(),
+                response.as_ptr().cast(),
+                response.len() as u32,
+            ));
+
+            let mut received = Vec::new();
+            assert!(receive_message_on_port(
+                reply_port,
+                &mut received,
+                "owned_mach_reply_test",
+            ));
+            assert!(received.starts_with(response));
+
+            drop(destination);
+            mach_deallocate_reply_port(reply_port);
+        }
+    }
 }

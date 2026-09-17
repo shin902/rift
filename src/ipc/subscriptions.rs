@@ -6,13 +6,16 @@ use std::thread;
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
 use crate::common::collections::{HashMap, HashSet};
 use crate::model::broadcast::BroadcastEvent;
-use crate::sys::mach::{mach_release_send_right, mach_retain_send_right, mach_try_send_message};
+use crate::sys::mach::{
+    mach_release_send_right, mach_retain_send_right, mach_try_send_message,
+    mach_unwatch_send_right, mach_watch_send_right,
+};
 
 pub type ClientPort = u32;
 
@@ -29,7 +32,11 @@ pub struct ServerState {
     event_dispatch_tx: Sender<DispatchBatch>,
 }
 
-pub type SharedServerState = Arc<RwLock<ServerState>>;
+/// Subscription state is internally synchronized by `DashMap`, `Mutex`, and
+/// the dispatch channel. An outer lock would serialize otherwise independent
+/// subscription and publication operations without protecting any additional
+/// invariant.
+pub type SharedServerState = Arc<ServerState>;
 
 const EVENT_DISPATCH_QUEUE_CAPACITY: usize = 4096;
 
@@ -63,10 +70,9 @@ impl ServerState {
         }
     }
 
-    pub fn subscribe_client(&self, client_port: ClientPort, event: String) {
+    pub fn subscribe_client(&self, client_port: ClientPort, event: String) -> bool {
         info!("Client {} subscribing to event: {}", client_port, event);
         let mut added = false;
-        let mut should_retain_send_right = false;
 
         match self.subscriptions_by_client.entry(client_port) {
             Entry::Occupied(mut entry) => {
@@ -77,16 +83,21 @@ impl ServerState {
                 }
             }
             Entry::Vacant(entry) => {
+                if !unsafe { mach_retain_send_right(client_port) } {
+                    warn!("Failed to retain send right for client {}", client_port);
+                    return false;
+                }
+                if !unsafe { mach_watch_send_right(client_port) } {
+                    let _ = unsafe { mach_release_send_right(client_port) };
+                    warn!("Failed to watch client {} for disconnection", client_port);
+                    return false;
+                }
                 added = true;
-                should_retain_send_right = true;
                 entry.insert(vec![event.clone()]);
             }
         }
 
         if added {
-            if should_retain_send_right {
-                let _ = unsafe { mach_retain_send_right(client_port) };
-            }
             self.subscriptions_by_event
                 .entry(event.clone())
                 .and_modify(|clients| {
@@ -97,6 +108,7 @@ impl ServerState {
                 .or_insert_with(|| vec![client_port]);
             info!("Client {} now subscribed to '{}'", client_port, event);
         }
+        true
     }
 
     pub fn unsubscribe_client(&self, client_port: ClientPort, event: String) {
@@ -177,11 +189,11 @@ impl ServerState {
     }
 
     pub fn publish(&self, event: BroadcastEvent) {
-        self.forward_event_to_cli_subscribers(event.clone());
-        self.forward_event_to_subscribers(event);
+        self.forward_event_to_cli_subscribers(&event);
+        self.forward_event_to_subscribers(&event);
     }
 
-    fn forward_event_to_subscribers(&self, event: BroadcastEvent) {
+    fn forward_event_to_subscribers(&self, event: &BroadcastEvent) {
         let event_name = event.kind().as_str();
 
         let mut targets: HashSet<ClientPort> = HashSet::default();
@@ -196,7 +208,7 @@ impl ServerState {
             return;
         }
 
-        let event_json = match serde_json::to_string(&event) {
+        let event_json = match serde_json::to_string(event) {
             Ok(s) => s,
             Err(e) => {
                 error!("Failed to serialize broadcast event: {}", e);
@@ -224,7 +236,7 @@ impl ServerState {
         }
     }
 
-    fn forward_event_to_cli_subscribers(&self, event: BroadcastEvent) {
+    fn forward_event_to_cli_subscribers(&self, event: &BroadcastEvent) {
         let event_name = event.kind().as_str();
 
         // Collect relevant subscriptions without full HashMap clone
@@ -240,7 +252,7 @@ impl ServerState {
         }
 
         for subscription in relevant {
-            crate::ipc::cli_exec::execute_cli_subscription(&event, &subscription);
+            crate::ipc::cli_exec::execute_cli_subscription(event, &subscription);
         }
     }
 
@@ -311,6 +323,7 @@ impl ServerState {
                     }
                 }
             }
+            unsafe { mach_unwatch_send_right(client_port) };
             let _ = unsafe { mach_release_send_right(client_port) };
         }
     }
